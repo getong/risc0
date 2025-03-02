@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use anyhow::Result;
+use branch_hints::{likely, unlikely};
 use derive_more::Debug;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
 use risc0_binfmt::{ByteAddr, WordAddr};
@@ -502,36 +503,36 @@ impl Emulator {
             InsnKind::MulHSU => (sign_extend_u32(rs1).wrapping_mul(rs2 as i64) >> 32) as u32,
             InsnKind::MulHU => (((rs1 as u64).wrapping_mul(rs2 as u64)) >> 32) as u32,
             InsnKind::Div => {
-                if rs2 == 0 {
-                    u32::MAX
-                } else {
+                if likely(rs2 != 0) {
                     ((rs1 as i32).wrapping_div(rs2 as i32)) as u32
+                } else {
+                    u32::MAX
                 }
             }
             InsnKind::DivU => {
-                if rs2 == 0 {
-                    u32::MAX
-                } else {
+                if likely(rs2 != 0) {
                     rs1 / rs2
+                } else {
+                    u32::MAX
                 }
             }
             InsnKind::Rem => {
-                if rs2 == 0 {
-                    rs1
-                } else {
+                if likely(rs2 != 0) {
                     ((rs1 as i32).wrapping_rem(rs2 as i32)) as u32
+                } else {
+                    rs1
                 }
             }
             InsnKind::RemU => {
-                if rs2 == 0 {
-                    rs1
-                } else {
+                if likely(rs2 != 0) {
                     rs1 % rs2
+                } else {
+                    rs1
                 }
             }
             _ => unreachable!(),
         };
-        if !new_pc.is_aligned() {
+        if unlikely(!new_pc.is_aligned()) {
             return ctx.trap(Exception::InstructionMisaligned);
         }
         ctx.store_register(rd as usize, out)?;
@@ -547,7 +548,7 @@ impl Emulator {
     ) -> Result<bool> {
         let rs1 = ctx.load_register(decoded.rs1 as usize)?;
         let addr = ByteAddr(rs1.wrapping_add(decoded.imm_i()));
-        if !ctx.check_data_load(addr) {
+        if unlikely(!ctx.check_data_load(addr)) {
             return ctx.trap(Exception::LoadAccessFault(addr));
         }
         let data = ctx.load_memory(addr.waddr())?;
@@ -561,7 +562,7 @@ impl Emulator {
                 out
             }
             InsnKind::Lh => {
-                if addr.0 & 0x01 != 0 {
+                if unlikely(addr.0 & 0x01 != 0) {
                     return ctx.trap(Exception::LoadAddressMisaligned);
                 }
                 let mut out = (data >> shift) & 0xffff;
@@ -571,14 +572,14 @@ impl Emulator {
                 out
             }
             InsnKind::Lw => {
-                if addr.0 & 0x03 != 0 {
+                if unlikely(addr.0 & 0x03 != 0) {
                     return ctx.trap(Exception::LoadAddressMisaligned);
                 }
                 data
             }
             InsnKind::LbU => (data >> shift) & 0xff,
             InsnKind::LhU => {
-                if addr.0 & 0x01 != 0 {
+                if unlikely(addr.0 & 0x01 != 0) {
                     return ctx.trap(Exception::LoadAddressMisaligned);
                 }
                 (data >> shift) & 0xffff
@@ -600,7 +601,7 @@ impl Emulator {
         let rs2 = ctx.load_register(decoded.rs2 as usize)?;
         let addr = ByteAddr(rs1.wrapping_add(decoded.imm_s()));
         let shift = 8 * (addr.0 & 3);
-        if !ctx.check_data_store(addr) {
+        if unlikely(!ctx.check_data_store(addr)) {
             return ctx.trap(Exception::StoreAccessFault);
         }
         let mut data = ctx.load_memory(addr.waddr())?;
@@ -610,7 +611,7 @@ impl Emulator {
                 data |= (rs2 & 0xff) << shift;
             }
             InsnKind::Sh => {
-                if addr.0 & 0x01 != 0 {
+                if unlikely(addr.0 & 0x01 != 0) {
                     tracing::debug!("Misaligned SH");
                     return ctx.trap(Exception::StoreAddressMisaligned(addr));
                 }
@@ -618,7 +619,7 @@ impl Emulator {
                 data |= (rs2 & 0xffff) << shift;
             }
             InsnKind::Sw => {
-                if addr.0 & 0x03 != 0 {
+                if unlikely(addr.0 & 0x03 != 0) {
                     tracing::debug!("Misaligned SW");
                     return ctx.trap(Exception::StoreAddressMisaligned(addr));
                 }
@@ -631,6 +632,7 @@ impl Emulator {
         Ok(true)
     }
 
+    #[inline]
     fn step_system<M: EmuContext>(
         &mut self,
         ctx: &mut M,

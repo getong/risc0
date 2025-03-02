@@ -640,6 +640,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "branch_hints"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "563f5c490d4067ffedc27856627e2c04f3657ef84d7889590e76f544ef96d797"
+
+[[package]]
 name = "browser-verify"
 version = "0.1.0"
 dependencies = [
@@ -3840,6 +3846,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "auto_ops",
+ "branch_hints",
  "bytemuck",
  "byteorder",
  "cfg-if",

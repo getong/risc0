@@ -313,6 +313,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "branch_hints"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "563f5c490d4067ffedc27856627e2c04f3657ef84d7889590e76f544ef96d797"
+
+[[package]]
 name = "bytemuck"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -876,6 +882,7 @@ name = "risc0-circuit-rv32im-v2"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "branch_hints",
  "bytemuck",
  "derive_more",
  "paste",

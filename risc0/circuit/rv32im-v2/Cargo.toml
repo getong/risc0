@@ -20,6 +20,7 @@ derive_more = { version = "2.0.1", default-features = false, features = [
   "debug",
 ] }
 paste = "1.0"
+branch_hints = "0.4.11"
 risc0-binfmt = { workspace = true }
 risc0-core = { workspace = true }
 risc0-zkp = { workspace = true, default-features = false }

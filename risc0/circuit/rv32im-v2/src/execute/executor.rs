@@ -267,7 +267,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         self.phys_cycles + self.pager.cycles + LOOKUP_TABLE_CYCLES as u32
     }
 
-    #[inline]
+    #[inline(always)]
     fn trace(&mut self, event: TraceEvent) -> Result<()> {
         // Only trace if we have trace callbacks registered
         if !self.trace.is_empty() {
@@ -402,11 +402,11 @@ impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
     fn store_u32(&mut self, addr: WordAddr, word: u32) -> Result<()> {
         // Fast path for tracing
         if !self.trace.is_empty() {
-            // Avoid allocation when possible by using a fixed array
-            let region = word.to_be_bytes().to_vec();
+            // Use a fixed array to avoid allocations
+            let bytes = word.to_be_bytes();
             self.trace(TraceEvent::MemorySet {
                 addr: addr.baddr().0,
-                region,
+                region: bytes.to_vec(), // Still need to convert to vec for TraceEvent API
             })?;
         }
         self.pager.store(addr, word)
