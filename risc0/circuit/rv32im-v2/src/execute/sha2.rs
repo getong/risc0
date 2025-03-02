@@ -21,12 +21,14 @@ use crate::execute::{
     r0vm::{guest_addr, LoadOp, Risc0Context},
 };
 
+// Constants used in SHA2 implementation
+#[allow(dead_code)]
 const SHA2_LOAD_STATE_CYCLES: u32 = 4;
-const SHA2_LOAD_DATA_CYCLES: u32 = BLOCK_WORDS as u32;
+const SHA2_LOAD_DATA_CYCLES: u32 = BLOCK_WORDS as u32; // BLOCK_WORDS = 16
 const SHA2_MIX_CYCLES: u32 = 48;
 const SHA2_STORE_CYCLES: u32 = 4;
-const SHA2_BACK: usize =
-    (SHA2_LOAD_STATE_CYCLES + SHA2_LOAD_DATA_CYCLES + SHA2_MIX_CYCLES) as usize;
+// Pre-computed value: 4 + 16 + 48 = 68
+const SHA2_BACK: usize = 68;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Sha2State {
@@ -43,6 +45,7 @@ pub(crate) struct Sha2State {
 }
 
 impl Sha2State {
+    #[inline(always)]
     fn step(
         &mut self,
         ctx: &mut dyn Risc0Context,
@@ -56,16 +59,23 @@ impl Sha2State {
 }
 
 pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
-    let state_in_addr = guest_addr(ctx.load_machine_register(LoadOp::Record, REG_A0)?)?.waddr();
-    let state_out_addr = guest_addr(ctx.load_machine_register(LoadOp::Record, REG_A1)?)?.waddr();
-    let data_addr = guest_addr(ctx.load_machine_register(LoadOp::Record, REG_A2)?)?.waddr();
+    // Load all arguments at once
+    let reg_a0 = ctx.load_machine_register(LoadOp::Record, REG_A0)?;
+    let reg_a1 = ctx.load_machine_register(LoadOp::Record, REG_A1)?;
+    let reg_a2 = ctx.load_machine_register(LoadOp::Record, REG_A2)?;
     let count = ctx.load_machine_register(LoadOp::Record, REG_A3)? & 0xffff;
-    let k_addr = guest_addr(ctx.load_machine_register(LoadOp::Record, REG_A4)?)?.waddr();
-    tracing::trace!("sha2: {count} blocks");
-
+    let reg_a4 = ctx.load_machine_register(LoadOp::Record, REG_A4)?;
+    
+    // Process guest addresses after validating count to avoid wasting cycles on invalid calls
     if count > MAX_SHA_COUNT {
         bail!("Invalid count (too big) in sha2 ecall: {count}");
     }
+    
+    let state_in_addr = guest_addr(reg_a0)?.waddr();
+    let state_out_addr = guest_addr(reg_a1)?.waddr();
+    let data_addr = guest_addr(reg_a2)?.waddr();
+    let k_addr = guest_addr(reg_a4)?.waddr();
+    tracing::trace!("sha2: {count} blocks");
 
     let mut sha2 = Sha2State {
         state_in_addr,
@@ -85,18 +95,54 @@ pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
     let mut old_e = RingBuffer::<SHA2_BACK>::new();
     let mut old_w = RingBuffer::<BLOCK_WORDS>::new();
 
-    for i in 0..SHA2_LOAD_STATE_CYCLES {
-        sha2.round = i;
-        sha2.step(ctx, &mut cur_state, CycleState::ShaLoadState);
-        let a = ctx.load_u32(LoadOp::Record, sha2.state_in_addr + 3u32 - i)?;
-        let e = ctx.load_u32(LoadOp::Record, sha2.state_in_addr + 7u32 - i)?;
-        sha2.a = a.to_be();
-        sha2.e = e.to_be();
-        old_a.push(sha2.a);
-        old_e.push(sha2.e);
-        ctx.store_u32(sha2.state_out_addr + 3u32 - i, a)?;
-        ctx.store_u32(sha2.state_out_addr + 7u32 - i, e)?;
-    }
+    // Unroll small fixed loop for better performance
+    // i = 0
+    sha2.round = 0;
+    sha2.step(ctx, &mut cur_state, CycleState::ShaLoadState);
+    let a = ctx.load_u32(LoadOp::Record, sha2.state_in_addr + 3u32)?;
+    let e = ctx.load_u32(LoadOp::Record, sha2.state_in_addr + 7u32)?;
+    sha2.a = a.to_be();
+    sha2.e = e.to_be();
+    old_a.push(sha2.a);
+    old_e.push(sha2.e);
+    ctx.store_u32(sha2.state_out_addr + 3u32, a)?;
+    ctx.store_u32(sha2.state_out_addr + 7u32, e)?;
+    
+    // i = 1
+    sha2.round = 1;
+    sha2.step(ctx, &mut cur_state, CycleState::ShaLoadState);
+    let a = ctx.load_u32(LoadOp::Record, sha2.state_in_addr + 2u32)?;
+    let e = ctx.load_u32(LoadOp::Record, sha2.state_in_addr + 6u32)?;
+    sha2.a = a.to_be();
+    sha2.e = e.to_be();
+    old_a.push(sha2.a);
+    old_e.push(sha2.e);
+    ctx.store_u32(sha2.state_out_addr + 2u32, a)?;
+    ctx.store_u32(sha2.state_out_addr + 6u32, e)?;
+    
+    // i = 2
+    sha2.round = 2;
+    sha2.step(ctx, &mut cur_state, CycleState::ShaLoadState);
+    let a = ctx.load_u32(LoadOp::Record, sha2.state_in_addr + 1u32)?;
+    let e = ctx.load_u32(LoadOp::Record, sha2.state_in_addr + 5u32)?;
+    sha2.a = a.to_be();
+    sha2.e = e.to_be();
+    old_a.push(sha2.a);
+    old_e.push(sha2.e);
+    ctx.store_u32(sha2.state_out_addr + 1u32, a)?;
+    ctx.store_u32(sha2.state_out_addr + 5u32, e)?;
+    
+    // i = 3
+    sha2.round = 3;
+    sha2.step(ctx, &mut cur_state, CycleState::ShaLoadState);
+    let a = ctx.load_u32(LoadOp::Record, sha2.state_in_addr)?;
+    let e = ctx.load_u32(LoadOp::Record, sha2.state_in_addr + 4u32)?;
+    sha2.a = a.to_be();
+    sha2.e = e.to_be();
+    old_a.push(sha2.a);
+    old_e.push(sha2.e);
+    ctx.store_u32(sha2.state_out_addr, a)?;
+    ctx.store_u32(sha2.state_out_addr + 4u32, e)?;
 
     // HERE!
     while sha2.count != 0 {
@@ -149,36 +195,35 @@ pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
     Ok(())
 }
 
+#[inline]
 fn compute_ae(
     old_a: &RingBuffer<SHA2_BACK>,
     old_e: &RingBuffer<SHA2_BACK>,
     k: u32,
     w: u32,
 ) -> (u32, u32) {
-    macro_rules! ch {
-        ($x:expr, $y:expr, $z:expr) => {
-            ($x & $y) ^ (!($x) & $z)
-        };
+    // Define helper functions as inlined functions rather than macros for better optimization
+    #[inline(always)]
+    fn ch(x: u32, y: u32, z: u32) -> u32 {
+        (x & y) ^ (!x & z)
     }
 
-    macro_rules! maj {
-        ($x:expr, $y:expr, $z:expr) => {
-            ($x & $y) ^ ($x & $z) ^ ($y & $z)
-        };
+    #[inline(always)]
+    fn maj(x: u32, y: u32, z: u32) -> u32 {
+        (x & y) ^ (x & z) ^ (y & z)
     }
 
-    macro_rules! epsilon0 {
-        ($x:expr) => {
-            ($x.rotate_right(2) ^ $x.rotate_right(13) ^ $x.rotate_right(22))
-        };
+    #[inline(always)]
+    fn epsilon0(x: u32) -> u32 {
+        x.rotate_right(2) ^ x.rotate_right(13) ^ x.rotate_right(22)
     }
 
-    macro_rules! epsilon1 {
-        ($x:expr) => {
-            $x.rotate_right(6) ^ $x.rotate_right(11) ^ $x.rotate_right(25)
-        };
+    #[inline(always)]
+    fn epsilon1(x: u32) -> u32 {
+        x.rotate_right(6) ^ x.rotate_right(11) ^ x.rotate_right(25)
     }
 
+    // Pre-load all values needed to reduce repeated array lookups
     let a = old_a.back(1);
     let b = old_a.back(2);
     let c = old_a.back(3);
@@ -188,34 +233,42 @@ fn compute_ae(
     let g = old_e.back(3);
     let h = old_e.back(4);
 
-    let t1 = h
-        .wrapping_add(epsilon1!(e))
-        .wrapping_add(ch!(e, f, g))
-        .wrapping_add(k)
-        .wrapping_add(w);
-    let t2 = epsilon0!(a).wrapping_add(maj!(a, b, c));
-    let e = d.wrapping_add(t1);
-    let a = t1.wrapping_add(t2);
-    (a, e)
+    // Calculate intermediate values
+    let e1 = epsilon1(e);
+    let ch_efg = ch(e, f, g);
+    let e0 = epsilon0(a);
+    let maj_abc = maj(a, b, c);
+    
+    // Compute final values using wrapping arithmetic
+    let t1 = h.wrapping_add(e1).wrapping_add(ch_efg).wrapping_add(k).wrapping_add(w);
+    let t2 = e0.wrapping_add(maj_abc);
+    let new_e = d.wrapping_add(t1);
+    let new_a = t1.wrapping_add(t2);
+    
+    (new_a, new_e)
 }
 
+#[inline]
 fn compute_w(old_w: &RingBuffer<16>) -> u32 {
-    macro_rules! sigma0 {
-        ($x:expr) => {
-            $x.rotate_right(7) ^ $x.rotate_right(18) ^ ($x >> 3)
-        };
+    // Define helper functions as inlined functions rather than macros for better optimization
+    #[inline(always)]
+    fn sigma0(x: u32) -> u32 {
+        x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3)
     }
 
-    macro_rules! sigma1 {
-        ($x:expr) => {
-            $x.rotate_right(17) ^ $x.rotate_right(19) ^ ($x >> 10)
-        };
+    #[inline(always)]
+    fn sigma1(x: u32) -> u32 {
+        x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10)
     }
 
-    sigma1!(old_w.back(2))
-        .wrapping_add(old_w.back(7))
-        .wrapping_add(sigma0!(old_w.back(15)))
-        .wrapping_add(old_w.back(16))
+    // Pre-load values to avoid repeated lookups
+    let w2 = old_w.back(2);
+    let w7 = old_w.back(7);
+    let w15 = old_w.back(15);
+    let w16 = old_w.back(16);
+    
+    // Compute using wrapping arithmetic
+    sigma1(w2).wrapping_add(w7).wrapping_add(sigma0(w15)).wrapping_add(w16)
 }
 
 struct RingBuffer<const N: usize> {
@@ -224,6 +277,7 @@ struct RingBuffer<const N: usize> {
 }
 
 impl<const N: usize> RingBuffer<N> {
+    #[inline(always)]
     fn new() -> Self {
         Self {
             buf: [0; N],
@@ -231,13 +285,15 @@ impl<const N: usize> RingBuffer<N> {
         }
     }
 
+    #[inline(always)]
     fn push(&mut self, value: u32) {
         self.buf[self.cur] = value;
-        self.cur += 1;
-        self.cur %= N;
+        self.cur = (self.cur + 1) % N;
     }
 
+    #[inline(always)]
     fn back(&self, i: usize) -> u32 {
+        // This is a hot path in the SHA2 implementation
         self.buf[(N + self.cur - i) % N]
     }
 }

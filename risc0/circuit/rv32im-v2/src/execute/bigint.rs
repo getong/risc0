@@ -29,14 +29,14 @@ use super::{
     CycleState,
 };
 
-pub(crate) const BIGINT_STATE_COUNT: usize = 5 + 16;
-pub(crate) const BIGINT_ACCUM_STATE_COUNT: usize = 3 * 4;
+pub(crate) const BIGINT_STATE_COUNT: usize = 21;
+pub(crate) const BIGINT_ACCUM_STATE_COUNT: usize = 12;
 
 /// BigInt width, in words, handled by the BigInt accelerator circuit.
 pub(crate) const BIGINT_WIDTH_WORDS: usize = 4;
 
 /// BigInt width, in bytes, handled by the BigInt accelerator circuit.
-pub(crate) const BIGINT_WIDTH_BYTES: usize = BIGINT_WIDTH_WORDS * WORD_SIZE;
+pub(crate) const BIGINT_WIDTH_BYTES: usize = 16; //BIGINT_WIDTH_WORDS * WORD_SIZE
 
 pub(crate) type BigIntBytes = [u8; BIGINT_WIDTH_BYTES];
 type BigIntWitness = HashMap<WordAddr, BigIntBytes>;
@@ -89,46 +89,75 @@ impl Instruction {
     // 3  2   2  2    1               0
     // 1  8   4  1    6               0
     // mmmmppppcccaaaaaoooooooooooooooo
+    #[inline]
     pub fn decode(insn: u32) -> Result<Self> {
+        // Extract all fields at once with bit masks
+        let mem_op_bits = (insn >> 28) & 0x0f;
+        let poly_op_bits = (insn >> 24) & 0x0f;
+        let coeff_bits = (insn >> 21) & 0x07;
+        let reg = (insn >> 16) & 0x1f;
+        let offset = insn & 0xffff;
+
+        // Convert to appropriate enum types
+        let mem_op = MemoryOp::from_u32(mem_op_bits)
+            .ok_or_else(|| anyhow!("Invalid mem_op in bigint program"))?;
+        let poly_op = PolyOp::from_u32(poly_op_bits)
+            .ok_or_else(|| anyhow!("Invalid poly_op in bigint program"))?;
+
+        // The coefficient is offset by 4
+        let coeff = coeff_bits as i32 - 4;
+
         Ok(Self {
-            mem_op: MemoryOp::from_u32(insn >> 28 & 0x0f)
-                .ok_or_else(|| anyhow!("Invalid mem_op in bigint program"))?,
-            poly_op: PolyOp::from_u32(insn >> 24 & 0x0f)
-                .ok_or_else(|| anyhow!("Invalid poly_op in bigint program"))?,
-            coeff: (insn >> 21 & 0x07) as i32 - 4,
-            reg: insn >> 16 & 0x1f,
-            offset: insn & 0xffff,
+            mem_op,
+            poly_op,
+            coeff,
+            reg,
+            offset,
         })
     }
 }
 
 impl BigInt {
+    #[inline]
     fn run(&mut self, ctx: &mut dyn Risc0Context, witness: &BigIntWitness) -> Result<()> {
         ctx.on_bigint_cycle(CycleState::BigIntEcall, &self.state);
+        // Hot loop - keep executing steps until we're done
         while self.state.next_state == CycleState::BigIntStep {
             self.step(ctx, witness)?;
         }
         Ok(())
     }
 
+    #[inline]
     fn step(&mut self, ctx: &mut dyn Risc0Context, witness: &BigIntWitness) -> Result<()> {
+        // Increment program counter
         self.state.pc.inc();
-        let insn = Instruction::decode(ctx.load_u32(LoadOp::Record, self.state.pc)?)?;
 
+        // Fetch and decode instruction
+        let insn_word = ctx.load_u32(LoadOp::Record, self.state.pc)?;
+        let insn = Instruction::decode(insn_word)?;
+
+        // Calculate effective address
         let base =
             ctx.load_aligned_addr_from_machine_register(LoadOp::Record, insn.reg as usize)?;
         let addr = base + insn.offset * BIGINT_WIDTH_WORDS as u32;
 
         tracing::trace!("step({:?}, {insn:?}, {addr:?})", self.state.pc);
+
+        // Handle different memory operations based on instruction type
         if insn.mem_op == MemoryOp::Check && insn.poly_op != PolyOp::Reset {
+            // Lazy computation of carry propagation
             if !self.program.in_carry {
                 self.program.in_carry = true;
                 self.program.total_carry = self.program.total.clone();
+
+                // Pre-declare carry outside the loop to avoid multiple init/drops
                 let mut carry = 0;
 
-                // Do carry propagation
+                // Optimize carry propagation (hot loop)
                 for coeff in self.program.total_carry.coeffs.iter_mut() {
                     *coeff += carry;
+                    // Error checking is rare, use ensure macro for cleaner code flow
                     ensure!(*coeff % 256 == 0, "bad carry");
                     *coeff /= 256;
                     carry = *coeff;
@@ -136,50 +165,81 @@ impl BigInt {
                 tracing::trace!("carry propagate complete");
             }
 
-            let base_point = 128 * 256 * 64;
-            for (i, ret) in self.state.bytes.iter_mut().enumerate() {
-                let offset = insn.offset as usize;
-                let coeff = self.program.total_carry.coeffs[offset * BIGINT_WIDTH_BYTES + i] as u32;
-                let value = coeff.wrapping_add(base_point);
-                match insn.poly_op {
-                    PolyOp::Carry1 => *ret = ((value >> 14) & 0xff) as u8,
-                    PolyOp::Carry2 => *ret = ((value >> 8) & 0x3f) as u8,
-                    PolyOp::Shift | PolyOp::EqZero => *ret = (value & 0xff) as u8,
-                    _ => {
-                        bail!("Invalid poly_op in bigint program")
+            // Pre-compute common base value
+            const BASE_POINT: u32 = 128 * 256 * 64;
+
+            // Pre-compute indices for better cache locality
+            let offset = insn.offset as usize;
+            let base_idx = offset * BIGINT_WIDTH_BYTES;
+
+            // Single-path processing based on instruction type
+            match insn.poly_op {
+                PolyOp::Carry1 => {
+                    for (i, ret) in self.state.bytes.iter_mut().enumerate() {
+                        let coeff = self.program.total_carry.coeffs[base_idx + i] as u32;
+                        let value = coeff.wrapping_add(BASE_POINT);
+                        *ret = ((value >> 14) & 0xff) as u8;
                     }
+                }
+                PolyOp::Carry2 => {
+                    for (i, ret) in self.state.bytes.iter_mut().enumerate() {
+                        let coeff = self.program.total_carry.coeffs[base_idx + i] as u32;
+                        let value = coeff.wrapping_add(BASE_POINT);
+                        *ret = ((value >> 8) & 0x3f) as u8;
+                    }
+                }
+                PolyOp::Shift | PolyOp::EqZero => {
+                    for (i, ret) in self.state.bytes.iter_mut().enumerate() {
+                        let coeff = self.program.total_carry.coeffs[base_idx + i] as u32;
+                        let value = coeff.wrapping_add(BASE_POINT);
+                        *ret = (value & 0xff) as u8;
+                    }
+                }
+                _ => {
+                    bail!("Invalid poly_op in bigint program")
                 }
             }
         } else if insn.mem_op == MemoryOp::Read {
+            // Load data from memory in batches
             for i in 0..BIGINT_WIDTH_WORDS {
                 let word = ctx.load_u32(LoadOp::Record, addr + i)?;
-                for (j, byte) in word.to_le_bytes().iter().enumerate() {
-                    self.state.bytes[i * WORD_SIZE + j] = *byte;
-                }
+                let bytes = word.to_le_bytes();
+                // Direct copy for better performance
+                let start_idx = i * WORD_SIZE;
+                self.state.bytes[start_idx..start_idx + WORD_SIZE].copy_from_slice(&bytes);
             }
         } else if !addr.is_null() {
+            // Get witness data if available
             self.state.bytes = *witness
                 .get(&addr)
                 .ok_or_else(|| anyhow!("Missing bigint witness: {addr:?}"))?;
+
+            // Write data to memory if needed
             if insn.mem_op == MemoryOp::Write {
+                // Use cast_slice for zero-copy conversion
                 let words: &[u32] = bytemuck::cast_slice(&self.state.bytes);
-                for (i, word) in words.iter().enumerate() {
-                    ctx.store_u32(addr + i, *word)?;
+                for (i, &word) in words.iter().enumerate() {
+                    ctx.store_u32(addr + i, word)?;
                 }
             }
         }
 
+        // Execute program step
         self.program.step(&insn, &self.state.bytes)?;
 
+        // Update state
         self.state.is_ecall = false;
         self.state.poly_op = insn.poly_op;
         self.state.coeff = (insn.coeff + 4) as u32;
-        self.state.next_state = if !self.state.is_ecall && insn.poly_op == PolyOp::Reset {
-            CycleState::Decode
-        } else {
-            CycleState::BigIntStep
-        };
 
+        // Determine next state - use direct assignment rather than conditional expression
+        if !self.state.is_ecall && insn.poly_op == PolyOp::Reset {
+            self.state.next_state = CycleState::Decode;
+        } else {
+            self.state.next_state = CycleState::BigIntStep;
+        }
+
+        // Notify context of cycle completion
         ctx.on_bigint_cycle(CycleState::BigIntStep, &self.state);
         Ok(())
     }
@@ -199,22 +259,36 @@ impl<'a> BigIntIOImpl<'a> {
     }
 }
 
+#[inline]
 fn bytes_le_to_bigint(bytes: &[u8]) -> Natural {
-    let mut limbs = Vec::with_capacity((bytes.len() + 3) / 4);
+    // Pre-allocate with exact capacity needed
+    let num_limbs = (bytes.len() + 3) / 4;
+    let mut limbs = Vec::with_capacity(num_limbs);
 
+    // Process in chunks of 4 bytes (u32 limbs)
     for chunk in bytes.chunks(4) {
         let mut arr = [0u8; 4];
-        arr[..chunk.len()].copy_from_slice(chunk);
+        // Handle the last chunk (which may be less than 4 bytes)
+        if chunk.len() == 4 {
+            // Fast path for full chunks
+            arr.copy_from_slice(chunk);
+        } else {
+            // Only partial chunk available
+            arr[..chunk.len()].copy_from_slice(chunk);
+        }
         limbs.push(u32::from_le_bytes(arr));
     }
 
     Natural::from_limbs_asc(&limbs)
 }
 
+#[inline]
 fn bigint_to_bytes_le(value: &Natural) -> Vec<u8> {
     let limbs = value.to_limbs_asc();
+    // Pre-allocate exactly the right size
     let mut out = Vec::with_capacity(limbs.len() * 4);
 
+    // Convert each 32-bit limb to bytes
     for limb in limbs {
         out.extend_from_slice(&limb.to_le_bytes());
     }
@@ -222,35 +296,56 @@ fn bigint_to_bytes_le(value: &Natural) -> Vec<u8> {
 }
 
 impl BigIntIO for BigIntIOImpl<'_> {
+    #[inline]
     fn load(&mut self, arena: u32, offset: u32, count: u32) -> Result<Natural> {
         tracing::trace!("load(arena: {arena}, offset: {offset}, count: {count})");
+
+        // Calculate effective address
         let base = self
             .ctx
             .load_aligned_addr_from_machine_register(LoadOp::Load, arena as usize)?;
         let addr = base + offset * BIGINT_WIDTH_WORDS as u32;
+
+        // Load memory region as bytes
         let bytes = self
             .ctx
             .load_region(LoadOp::Load, addr.baddr(), count as usize)?;
+
+        // Convert to Natural and return
         let val = bytes_le_to_bigint(&bytes);
         Ok(val)
     }
 
+    #[inline]
     fn store(&mut self, arena: u32, offset: u32, count: u32, value: &Natural) -> Result<()> {
+        // Calculate effective address
         let base = self
             .ctx
             .load_aligned_addr_from_machine_register(LoadOp::Load, arena as usize)?;
         let addr = base + offset * BIGINT_WIDTH_WORDS as u32;
+
         tracing::trace!("store(arena: {arena}, offset: {offset}, count: {count}, addr: {addr:?}, value: {value})");
 
-        let mut witness = vec![0u8; count as usize];
+        // Convert Natural to bytes
         let bytes = bigint_to_bytes_le(value);
+
+        // Pre-allocate with zeros and copy value bytes
+        let mut witness = vec![0u8; count as usize];
         witness[..bytes.len()].copy_from_slice(&bytes);
+
+        // Chunk into fixed-size pieces and store in witness map
+        let chunk_count = count as usize / BIGINT_WIDTH_BYTES;
         let chunks = witness.chunks_exact(BIGINT_WIDTH_BYTES);
-        assert_eq!(chunks.len(), count as usize / BIGINT_WIDTH_BYTES);
+
+        // Verify chunk count matches expected
+        debug_assert_eq!(chunks.len(), chunk_count, "Incorrect chunk count");
+
+        // Store each chunk in the witness map
         for (i, chunk) in chunks.enumerate() {
-            let addr = addr + i * BIGINT_WIDTH_WORDS;
-            let chunk = chunk.try_into().unwrap();
-            self.witness.insert(addr, chunk);
+            let chunk_addr = addr + i * BIGINT_WIDTH_WORDS;
+            // Use try_into() directly with unwrap since we know the size is correct
+            let chunk_bytes: BigIntBytes = chunk.try_into().unwrap();
+            self.witness.insert(chunk_addr, chunk_bytes);
         }
 
         Ok(())
@@ -260,48 +355,55 @@ impl BigIntIO for BigIntIOImpl<'_> {
 pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
     tracing::debug!("ecall");
 
+    // Load all register values at once to minimize context switches
     let blob_ptr = ctx.load_aligned_addr_from_machine_register(LoadOp::Load, REG_A0)?;
     let nondet_program_ptr = ctx.load_aligned_addr_from_machine_register(LoadOp::Load, REG_T1)?;
     let verify_program_ptr =
         ctx.load_aligned_addr_from_machine_register(LoadOp::Record, REG_T2)? - 1;
     let consts_ptr = ctx.load_aligned_addr_from_machine_register(LoadOp::Load, REG_T3)?;
 
+    // Load program sizes from blob
     let nondet_program_size = ctx.load_u32(LoadOp::Load, blob_ptr)?;
     let verify_program_size = ctx.load_u32(LoadOp::Load, blob_ptr + 1)?;
     let consts_size = ctx.load_u32(LoadOp::Load, blob_ptr + 2)?;
+
+    // Log debug information
     tracing::debug!("blob_ptr: {blob_ptr:?}");
     tracing::debug!(
         "nondet_program_ptr: {nondet_program_ptr:?}, nondet_program_size: {nondet_program_size}"
     );
 
-    let program_bytes = ctx.load_region(
-        LoadOp::Load,
-        nondet_program_ptr.baddr(),
-        nondet_program_size as usize * WORD_SIZE,
-    )?;
+    // Load non-deterministic program
+    let program_bytes_size = nondet_program_size as usize * WORD_SIZE;
+    let program_bytes =
+        ctx.load_region(LoadOp::Load, nondet_program_ptr.baddr(), program_bytes_size)?;
     tracing::debug!("program_bytes: {}", program_bytes.len());
+
+    // Decode program
     let mut cursor = Cursor::new(program_bytes);
     let program = bibc::Program::decode(&mut cursor)?;
 
+    // Evaluate program and collect witness data
     let witness = {
         let mut io = BigIntIOImpl::new(ctx);
         program.eval(&mut io)?;
         std::mem::take(&mut io.witness)
     };
 
+    // Load verification program and constants
     ctx.load_region(
         LoadOp::Load,
         verify_program_ptr.baddr(),
         verify_program_size as usize * WORD_SIZE,
     )?;
+
     ctx.load_region(
         LoadOp::Load,
         consts_ptr.baddr(),
         consts_size as usize * WORD_SIZE,
     )?;
 
-    // let cycles = verify_program_size as usize + 1;
-
+    // Initialize BigInt state and program
     let state = BigIntState {
         is_ecall: true,
         pc: verify_program_ptr,
@@ -311,10 +413,12 @@ pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
         next_state: CycleState::BigIntStep,
     };
 
+    // Create and run the BigInt program
     let mut bigint = BigInt {
         state,
         program: BytePolyProgram::new(),
     };
 
+    // Execute program with witness data
     bigint.run(ctx, &witness)
 }

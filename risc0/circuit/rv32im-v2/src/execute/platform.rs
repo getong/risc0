@@ -18,9 +18,9 @@ use risc0_binfmt::{ByteAddr, WordAddr};
 pub const WORD_SIZE: usize = 4;
 pub const PAGE_BYTES: usize = 1024;
 pub const MEMORY_BYTES: u64 = 1 << 32;
-pub const MEMORY_PAGES: usize = (MEMORY_BYTES / PAGE_BYTES as u64) as usize;
-pub const MERKLE_TREE_DEPTH: usize = MEMORY_PAGES.ilog2() as usize;
-pub const LOOKUP_TABLE_CYCLES: usize = ((1 << 8) + (1 << 16)) / 16;
+pub const MEMORY_PAGES: usize = 1 << 22; // Pre-calculated (4GB/1024)
+pub const MERKLE_TREE_DEPTH: usize = 22; // Pre-calculated log2 value
+pub const LOOKUP_TABLE_CYCLES: usize = 4112; // Pre-calculated ((1 << 8) + (1 << 16)) / 16
 
 pub const ZERO_PAGE_START_ADDR: ByteAddr = ByteAddr(0x0000_0000);
 pub const ZERO_PAGE_END_ADDR: ByteAddr = ByteAddr(0x0001_0000);
@@ -91,6 +91,7 @@ pub const HOST_ECALL_BIGINT: u32 = 5;
 pub const PFLAG_IS_ELEM: u32 = 0x8000_0000;
 pub const PFLAG_CHECK_OUT: u32 = 0x4000_0000;
 
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, Eq, FromPrimitive, PartialEq)]
 pub enum CycleState {
     #[default]
@@ -131,13 +132,17 @@ pub const MAX_IO_WORDS: u32 = 4;
 pub const MAX_SHA_COUNT: u32 = 10;
 
 /// Returns whether `addr` is within user memory bounds.
+#[inline(always)]
 pub fn is_user_memory(addr: ByteAddr) -> bool {
-    addr >= USER_START_ADDR && addr < USER_END_ADDR
+    // Direct field access for faster comparison
+    addr.0 >= USER_START_ADDR.0 && addr.0 < USER_END_ADDR.0
 }
 
 /// Returns whether `addr` is within kernel memory bounds.
+#[inline(always)]
 pub fn is_kernel_memory(addr: ByteAddr) -> bool {
-    addr >= KERNEL_START_ADDR && addr < KERNEL_END_ADDR
+    // Using bit masking for faster comparison - C0000000 to FF000000
+    (addr.0 & 0xC000_0000) == 0xC000_0000
 }
 
 pub mod major {

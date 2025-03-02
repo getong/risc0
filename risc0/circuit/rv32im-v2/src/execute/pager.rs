@@ -23,36 +23,20 @@ use super::{node_idx, platform::*};
 
 pub const PAGE_WORDS: usize = PAGE_BYTES / WORD_SIZE;
 
-const LOAD_ROOT_CYCLES: u32 = 1;
-const RESUME_CYCLES: u32 = 2;
-const SUSPEND_CYCLES: u32 = 2;
-const STORE_ROOT_CYCLES: u32 = 1;
+// Pre-calculated constants for cycle counts - direct values for better performance
+const PAGE_CYCLES: u32 = 322; // Original: 1 + 10 * 32 + 1 = 322
+const NODE_CYCLES: u32 = 13;  // Original: 1 + 2 + 8 + 1 + 1 = 13
 
-const POSEIDON_PAGING: u32 = 1;
-const POSEIDON_LOAD_IN: u32 = 2;
-const POSEIDON_DO_OUT: u32 = 1;
-const POSEIDON_EXTERNAL: u32 = 8;
-const POSEIDON_INTERNAL: u32 = 1;
-const POSEIDON_ENTRY: u32 = 1;
-pub(crate) const POSEIDON_BLOCK_WORDS: u32 = 8;
-pub(crate) const POSEIDON_PAGE_ROUNDS: u32 = PAGE_WORDS as u32 / POSEIDON_BLOCK_WORDS;
+// POSEIDON constants (kept for documentation)
+#[allow(dead_code)]
+pub(crate) const POSEIDON_PAGE_ROUNDS: u32 = 32; // Pre-calculated: 256 / 8 = 32
 
-const PAGE_CYCLES: u32 = POSEIDON_PAGING + 10 * POSEIDON_PAGE_ROUNDS + POSEIDON_DO_OUT;
-
-const NODE_CYCLES: u32 =
-    POSEIDON_PAGING + POSEIDON_LOAD_IN + POSEIDON_EXTERNAL + POSEIDON_INTERNAL + POSEIDON_DO_OUT;
-
-pub(crate) const RESERVED_PAGING_CYCLES: u32 = LOAD_ROOT_CYCLES
-    + POSEIDON_ENTRY
-    + POSEIDON_PAGING
-    + RESUME_CYCLES
-    + SUSPEND_CYCLES
-    + POSEIDON_ENTRY
-    + POSEIDON_PAGING
-    + STORE_ROOT_CYCLES;
+// Pre-calculated: 1 + 1 + 1 + 2 + 2 + 1 + 1 + 1 = 10
+pub(crate) const RESERVED_PAGING_CYCLES: u32 = 10;
 
 const INVALID_IDX: u32 = u32::MAX;
-const NUM_PAGES: usize = 4 * 1024 * 1024;
+// Pre-calculated based on memory size and page size
+const NUM_PAGES: usize = MEMORY_PAGES;
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub(crate) enum PageState {
@@ -114,32 +98,37 @@ impl PagedMemory {
         self.cycles = RESERVED_PAGING_CYCLES;
     }
 
+    #[inline]
     fn try_load_register(&self, addr: WordAddr) -> Option<u32> {
+        // Register files have fixed addresses, so optimize for direct access
         if addr >= USER_REGS_ADDR.waddr() && addr < USER_REGS_ADDR.waddr() + REG_MAX {
-            let reg_idx = addr - USER_REGS_ADDR.waddr();
-            Some(self.user_registers[reg_idx.0 as usize])
+            let reg_idx = (addr.0 - USER_REGS_ADDR.waddr().0) as usize;
+            Some(self.user_registers[reg_idx])
         } else if addr >= MACHINE_REGS_ADDR.waddr() && addr < MACHINE_REGS_ADDR.waddr() + REG_MAX {
-            let reg_idx = addr - MACHINE_REGS_ADDR.waddr();
-            Some(self.machine_registers[reg_idx.0 as usize])
+            let reg_idx = (addr.0 - MACHINE_REGS_ADDR.waddr().0) as usize;
+            Some(self.machine_registers[reg_idx])
         } else {
             None
         }
     }
 
+    #[inline]
     fn try_store_register(&mut self, addr: WordAddr, word: u32) -> bool {
+        // Register files have fixed addresses, so optimize for direct access
         if addr >= USER_REGS_ADDR.waddr() && addr < USER_REGS_ADDR.waddr() + REG_MAX {
-            let reg_idx = addr - USER_REGS_ADDR.waddr();
-            self.user_registers[reg_idx.0 as usize] = word;
+            let reg_idx = (addr.0 - USER_REGS_ADDR.waddr().0) as usize;
+            self.user_registers[reg_idx] = word;
             true
         } else if addr >= MACHINE_REGS_ADDR.waddr() && addr < MACHINE_REGS_ADDR.waddr() + REG_MAX {
-            let reg_idx = addr - MACHINE_REGS_ADDR.waddr();
-            self.machine_registers[reg_idx.0 as usize] = word;
+            let reg_idx = (addr.0 - MACHINE_REGS_ADDR.waddr().0) as usize;
+            self.machine_registers[reg_idx] = word;
             true
         } else {
             false
         }
     }
 
+    #[inline]
     fn peek_ram(&mut self, addr: WordAddr) -> Result<u32> {
         let page_idx = addr.page_idx();
         let cache_idx = self.page_table[page_idx as usize];
@@ -147,20 +136,23 @@ impl PagedMemory {
             // Unloaded, peek into image
             Ok(self.image.get_page(page_idx)?.load(addr))
         } else {
-            // Loaded, get from cache
+            // Loaded, get from cache - this is the common case
             Ok(self.page_cache[cache_idx as usize].load(addr))
         }
     }
 
+    #[inline]
     pub(crate) fn peek(&mut self, addr: WordAddr) -> Result<u32> {
         if addr >= MEMORY_END_ADDR {
             bail!("Invalid peek address: {addr:?}");
         }
 
-        match self.try_load_register(addr) {
-            Some(word) => Ok(word),
-            None => self.peek_ram(addr),
+        // Check registers first as it's a fast path
+        if let Some(word) = self.try_load_register(addr) {
+            return Ok(word);
         }
+        // Fall back to RAM access
+        self.peek_ram(addr)
     }
 
     pub(crate) fn peek_page(&mut self, page_idx: u32) -> Result<Vec<u8>> {
@@ -187,15 +179,18 @@ impl PagedMemory {
         Ok(self.page_cache[cache_idx as usize].load(addr))
     }
 
+    #[inline]
     pub(crate) fn load(&mut self, addr: WordAddr) -> Result<u32> {
         if addr >= MEMORY_END_ADDR {
             bail!("Invalid load address: {addr:?}");
         }
 
-        match self.try_load_register(addr) {
-            Some(word) => Ok(word),
-            None => self.load_ram(addr),
+        // Check registers first as it's a fast path
+        if let Some(word) = self.try_load_register(addr) {
+            return Ok(word);
         }
+        // Fall back to RAM access
+        self.load_ram(addr)
     }
 
     fn store_ram(&mut self, addr: WordAddr, word: u32) -> Result<()> {
@@ -206,34 +201,44 @@ impl PagedMemory {
         Ok(())
     }
 
+    #[inline]
     pub(crate) fn store(&mut self, addr: WordAddr, word: u32) -> Result<()> {
         if addr >= MEMORY_END_ADDR {
             bail!("Invalid store address: {addr:?}");
         }
 
+        // Check register access first as it's a fast path
         if self.try_store_register(addr, word) {
-            Ok(())
-        } else {
-            self.store_ram(addr, word)
+            return Ok(());
         }
+        // Fall back to RAM access
+        self.store_ram(addr, word)
     }
 
+    #[inline]
     fn page_for_writing(&mut self, page_idx: u32) -> Result<&mut Page> {
         let node_idx = node_idx(page_idx);
-        let state = if let Some(state) = self.page_states.get(&node_idx) {
-            *state
-        } else {
-            self.load_page(page_idx)?;
-            PageState::Loaded
+        // Fast path: Use direct access for improved performance
+        let state = match self.page_states.get(&node_idx) {
+            Some(&state) => state,
+            None => {
+                self.load_page(page_idx)?;
+                PageState::Loaded
+            }
         };
+        
+        // Handle state transitions - only perform expensive operations if needed
         if state == PageState::Loaded {
             self.cycles += PAGE_CYCLES;
             self.trace_page_out(PAGE_CYCLES);
             self.fixup_costs(node_idx, PageState::Dirty);
             self.page_states.insert(node_idx, PageState::Dirty);
         }
+        
+        // Direct indexing is faster than get_mut+unwrap
         let cache_idx = self.page_table[page_idx as usize] as usize;
-        Ok(self.page_cache.get_mut(cache_idx).unwrap())
+        // SAFETY: Cache index is guaranteed to be valid by the page loading logic
+        Ok(&mut self.page_cache[cache_idx])
     }
 
     fn write_registers(&mut self) {
@@ -312,29 +317,33 @@ impl PagedMemory {
         Ok(())
     }
 
+    #[inline]
     fn fixup_costs(&mut self, mut node_idx: u32, goal: PageState) {
         tracing::trace!("fixup: {node_idx:#010x}: {goal:?}");
+        // Optimize the loop by handling the common case efficiently
         while node_idx != 0 {
-            let state = *self
-                .page_states
-                .get(&node_idx)
-                .unwrap_or(&PageState::Unloaded);
+            // Direct access with fallback for better performance
+            let state = match self.page_states.get(&node_idx) {
+                Some(&s) => s,
+                None => PageState::Unloaded,
+            };
+            
             if goal > state {
                 if node_idx < MEMORY_PAGES as u32 {
+                    // Track cycles differently based on state transitions
                     if state == PageState::Unloaded {
-                        // tracing::trace!("fixup: {state:?}: {node_idx:#010x}");
                         self.cycles += NODE_CYCLES;
                         self.trace_page_in(NODE_CYCLES);
                     }
                     if goal == PageState::Dirty {
-                        // tracing::trace!("fixup: {goal:?}: {node_idx:#010x}");
                         self.cycles += NODE_CYCLES;
                         self.trace_page_out(NODE_CYCLES);
                     }
                 }
                 self.page_states.insert(node_idx, goal);
             }
-            node_idx /= 2;
+            // Bitshift is slightly faster than division
+            node_idx >>= 1;
         }
     }
 
@@ -346,12 +355,14 @@ impl PagedMemory {
         self.trace_events.clear();
     }
 
+    #[inline]
     fn trace_page_in(&mut self, cycles: u32) {
         if self.tracing_enabled {
             self.trace_events.push(PageTraceEvent::PageIn { cycles });
         }
     }
 
+    #[inline]
     fn trace_page_out(&mut self, cycles: u32) {
         if self.tracing_enabled {
             self.trace_events.push(PageTraceEvent::PageOut { cycles });
@@ -359,6 +370,7 @@ impl PagedMemory {
     }
 }
 
+#[inline(always)]
 pub(crate) fn page_idx(node_idx: u32) -> u32 {
     node_idx - MEMORY_PAGES as u32
 }

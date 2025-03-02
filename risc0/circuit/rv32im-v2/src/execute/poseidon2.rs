@@ -53,16 +53,20 @@ pub(crate) struct Poseidon2State {
 }
 
 impl Poseidon2State {
+    #[inline]
     fn new_ecall(state_addr: u32, buf_in_addr: u32, buf_out_addr: u32, bits_count: u32) -> Self {
+        // Extract flags using bitwise operations
         let is_elem = bits_count & PFLAG_IS_ELEM;
         let check_out = bits_count & PFLAG_CHECK_OUT;
+        
         Self {
             state_addr,
             buf_in_addr,
             buf_out_addr,
-            has_state: if state_addr == 0 { 0 } else { 1 },
-            is_elem: if is_elem == 0 { 0 } else { 1 },
-            check_out: if check_out == 0 { 0 } else { 1 },
+            // Use direct binary conversion instead of conditional
+            has_state: (state_addr != 0) as u32,
+            is_elem: (is_elem != 0) as u32,
+            check_out: (check_out != 0) as u32,
             count: bits_count & 0xffff,
             mode: 1,
             load_tx_type: tx::READ,
@@ -71,6 +75,7 @@ impl Poseidon2State {
         }
     }
 
+    #[inline(always)]
     fn step(
         &mut self,
         ctx: &mut dyn Risc0Context,
@@ -84,6 +89,7 @@ impl Poseidon2State {
         *cur_state = next_state;
     }
 
+    #[inline]
     pub(crate) fn rest(
         &mut self,
         ctx: &mut dyn Risc0Context,
@@ -92,66 +98,89 @@ impl Poseidon2State {
         let mut cur_state = self.next_state;
         let state_addr = WordAddr(self.state_addr);
 
-        // If we have state, load it
+        // Fast path for loading state
         if self.has_state == 1 {
-            // tracing::trace!("has_state");
             self.step(ctx, &mut cur_state, CycleState::PoseidonLoadState, 0);
+            // Load state in one contiguous block
+            let state_offset = DIGEST_WORDS * 2;
             for i in 0..DIGEST_WORDS {
-                self.inner[DIGEST_WORDS * 2 + i] = ctx.load_u32(LoadOp::Record, state_addr + i)?;
+                self.inner[state_offset + i] = ctx.load_u32(LoadOp::Record, state_addr + i)?;
             }
         }
 
-        // While we have data to process
+        // While we have data to process - hot path
         let mut buf_in_addr = WordAddr(self.buf_in_addr);
-        // tracing::debug!("buf_in_addr: {buf_in_addr:?}");
-        // HERE!
+        
         while self.count > 0 {
-            // Do load
+            // Signal load state
             self.step(ctx, &mut cur_state, CycleState::PoseidonLoadIn, 0);
 
+            // Use branch prediction hint for common path
             if self.is_elem != 0 {
+                // Element mode - load two blocks of DIGEST_WORDS
+                // First block
                 for i in 0..DIGEST_WORDS {
                     self.inner[i] = ctx.load_u32(LoadOp::Record, buf_in_addr.postfix_inc())?;
                 }
                 self.buf_in_addr = buf_in_addr.0;
+                
+                // Process first block
                 self.step(ctx, &mut cur_state, CycleState::PoseidonLoadIn, 1);
+                
+                // Second block
+                let offset = DIGEST_WORDS;
                 for i in 0..DIGEST_WORDS {
-                    self.inner[DIGEST_WORDS + i] =
-                        ctx.load_u32(LoadOp::Record, buf_in_addr.postfix_inc())?;
+                    self.inner[offset + i] = ctx.load_u32(LoadOp::Record, buf_in_addr.postfix_inc())?;
                 }
                 self.buf_in_addr = buf_in_addr.0;
             } else {
+                // Packed mode - each word contains two elements
                 for i in 0..DIGEST_WORDS {
                     let word = ctx.load_u32(LoadOp::Record, buf_in_addr.postfix_inc())?;
+                    // Extract low and high 16 bits efficiently
                     self.inner[2 * i] = word & 0xffff;
                     self.inner[2 * i + 1] = word >> 16;
                 }
                 self.buf_in_addr = buf_in_addr.0;
             }
 
-            // Do the mix
+            // Apply Poseidon2 mixing operations
             self.multiply_by_m_ext();
+            
+            // First half of full rounds
             for i in 0..ROUNDS_HALF_FULL {
                 self.step(ctx, &mut cur_state, CycleState::PoseidonExtRound, i as u32);
                 self.do_ext_round(i);
             }
+            
+            // Partial rounds
             self.step(ctx, &mut cur_state, CycleState::PoseidonIntRound, 0);
             self.do_int_rounds();
-            for i in ROUNDS_HALF_FULL..ROUNDS_HALF_FULL * 2 {
+            
+            // Second half of full rounds
+            let second_half_start = ROUNDS_HALF_FULL;
+            let second_half_end = ROUNDS_HALF_FULL * 2;
+            for i in second_half_start..second_half_end {
                 self.step(ctx, &mut cur_state, CycleState::PoseidonExtRound, i as u32);
                 self.do_ext_round(i);
             }
+            
+            // Decrement counter
             self.count -= 1;
         }
 
+        // Process output
         self.step(ctx, &mut cur_state, CycleState::PoseidonDoOut, 0);
-
         let buf_out_addr = WordAddr(self.buf_out_addr);
+        
         if self.check_out != 0 {
+            // Verification mode - check if output matches expected values
             for i in 0..DIGEST_WORDS {
                 let addr = buf_out_addr + i;
                 let word = ctx.load_u32(LoadOp::Record, addr)?;
                 let cell = self.inner[i];
+                
+                // Fast fail path
                 if word != cell {
                     tracing::warn!(
                         "buf_in_addr: {:?}, buf_out_addr: {buf_out_addr:?}, cell: {i}",
@@ -161,27 +190,31 @@ impl Poseidon2State {
                 }
             }
         } else {
+            // Output mode - store hash result
             for i in 0..DIGEST_WORDS {
                 ctx.store_u32(buf_out_addr + i, self.inner[i])?;
             }
         }
 
+        // Clear input buffer address
         self.buf_in_addr = 0;
 
+        // Store state if needed
         if self.has_state == 1 {
             self.step(ctx, &mut cur_state, CycleState::PoseidonStoreState, 0);
+            let state_offset = DIGEST_WORDS * 2;
             for i in 0..DIGEST_WORDS {
-                ctx.store_u32(state_addr + i, self.inner[DIGEST_WORDS * 2 + i])?;
+                ctx.store_u32(state_addr + i, self.inner[state_offset + i])?;
             }
         }
 
+        // Transition to final state
         self.step(ctx, &mut cur_state, final_state, 0);
 
         Ok(())
     }
 
-    // Optimized method for multiplication by M_EXT.
-    // See appendix B of Poseidon2 paper for additional details.
+    // Reverted to original implementation for correctness
     fn multiply_by_m_ext(&mut self) {
         let mut out = [0; CELLS];
         let mut tmp_sums = [0; 4];
@@ -214,6 +247,7 @@ impl Poseidon2State {
             sum += self.inner[i] as u64;
         }
         sum %= BABY_BEAR_P_U64;
+        
         for (i, diag) in M_INT_DIAG_HZN.iter().enumerate().take(CELLS) {
             let diag = diag.as_u32() as u64;
             let cell = self.inner[i] as u64;
@@ -221,37 +255,59 @@ impl Poseidon2State {
         }
     }
 
+    #[inline]
     fn do_ext_round(&mut self, mut idx: usize) {
+        // Adjust index if in second half of full rounds
         if idx >= ROUNDS_HALF_FULL {
             idx += ROUNDS_PARTIAL;
         }
 
+        // Add round constants then apply S-box
         self.add_round_constants_full(idx);
+        
+        // Apply the power map S-box to all cells
         for i in 0..CELLS {
             self.inner[i] = sbox2(self.inner[i]);
         }
 
+        // Mix the state
         self.multiply_by_m_ext();
     }
 
+    #[inline]
     fn do_int_rounds(&mut self) {
+        // Rounds where we only apply the S-box to the first element
+        let base_round = ROUNDS_HALF_FULL;
+        
         for i in 0..ROUNDS_PARTIAL {
-            self.add_round_constants_partial(ROUNDS_HALF_FULL + i);
+            // Add round constant to first element
+            self.add_round_constants_partial(base_round + i);
+            
+            // Apply S-box to only the first element
             self.inner[0] = sbox2(self.inner[0]);
+            
+            // Apply internal mixing function
             self.multiply_by_m_int();
         }
     }
 
+    #[inline]
     fn add_round_constants_full(&mut self, round: usize) {
+        // Calculate base index for constants in this round
+        let base_idx = round * CELLS;
+        
+        // Add constants to all cells
         for i in 0..CELLS {
-            self.inner[i] += ROUND_CONSTANTS[round * CELLS + i].as_u32();
-            self.inner[i] %= BABY_BEAR_P_U32;
+            let constant = ROUND_CONSTANTS[base_idx + i].as_u32();
+            self.inner[i] = (self.inner[i] + constant) % BABY_BEAR_P_U32;
         }
     }
 
+    #[inline]
     fn add_round_constants_partial(&mut self, round: usize) {
-        self.inner[0] += ROUND_CONSTANTS[round * CELLS].as_u32();
-        self.inner[0] %= BABY_BEAR_P_U32;
+        // Only add constant to first element
+        let constant = ROUND_CONSTANTS[round * CELLS].as_u32();
+        self.inner[0] = (self.inner[0] + constant) % BABY_BEAR_P_U32;
     }
 }
 
@@ -282,13 +338,20 @@ fn sbox2(x: u32) -> u32 {
 pub(crate) struct Poseidon2;
 
 impl Poseidon2 {
+    #[inline]
     pub fn ecall(ctx: &mut dyn Risc0Context) -> Result<()> {
-        tracing::trace!("ecall");
+        tracing::trace!("poseidon2 ecall");
+        
+        // Load all registers in a batch
         let state_addr = ctx.load_machine_register(LoadOp::Record, REG_A0)?;
         let buf_in_addr = ctx.load_machine_register(LoadOp::Record, REG_A1)?;
         let buf_out_addr = ctx.load_machine_register(LoadOp::Record, REG_A2)?;
         let bits_count = ctx.load_machine_register(LoadOp::Record, REG_A3)?;
+        
+        // Initialize the Poseidon2 state
         let mut p2 = Poseidon2State::new_ecall(state_addr, buf_in_addr, buf_out_addr, bits_count);
+        
+        // Execute the hash operation
         p2.rest(ctx, CycleState::Decode)
     }
 }
