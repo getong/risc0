@@ -21,6 +21,10 @@ pub mod prove;
 pub mod trace;
 mod zirgen;
 
+// Re-export ParallelConfig for public use
+#[cfg(feature = "execute")]
+pub use execute::executor::ParallelConfig;
+
 use core::num::TryFromIntError;
 
 use anyhow::{anyhow, Result};
@@ -54,7 +58,7 @@ pub struct HighLowU16(pub u16, pub u16);
 
 impl From<HighLowU16> for u32 {
     fn from(x: HighLowU16) -> Self {
-        (x.0 as u32) << 16 | (x.1 as u32)
+        ((x.0 as u32) << 16) | (x.1 as u32)
     }
 }
 

@@ -930,6 +930,7 @@ dependencies = [
  "branch_hints",
  "bytemuck",
  "derive_more",
+ "num_cpus",
  "paste",
  "risc0-binfmt",
  "risc0-core",

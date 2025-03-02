@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cmp::min, fmt::Write as _};
-
 use anyhow::{anyhow, bail, Result};
 use risc0_binfmt::{ByteAddr, WordAddr};
+use std::cmp::min;
+use std::fmt::Write as _;
 
 use super::{
     bigint::{self, BigIntState},
@@ -166,10 +166,12 @@ impl<'a, T: Risc0Context> Risc0Machine<'a, T> {
         this.ctx.resume()
     }
 
+    #[inline(always)]
     fn is_machine_mode(&self) -> bool {
         self.ctx.get_machine_mode() != 0
     }
 
+    #[inline(always)]
     fn next_pc(&mut self) {
         self.ctx.set_pc(self.ctx.get_pc() + WORD_SIZE);
     }
@@ -227,7 +229,9 @@ impl<'a, T: Risc0Context> Risc0Machine<'a, T> {
             guest_addr(ptr.0)?;
         }
         tracing::trace!("ecall_read({fd}, {ptr:?}, {len})");
+
         let mut bytes = vec![0u8; len as usize];
+
         let mut rlen = self.ctx.host_read(fd, &mut bytes)?;
         self.store_register(REG_A0, rlen)?;
         tracing::trace!("rlen: {rlen}");
@@ -278,7 +282,7 @@ impl<'a, T: Risc0Context> Risc0Machine<'a, T> {
 
         // HERE!
         while rlen >= MAX_IO_WORDS {
-            let words = min(rlen / MAX_IO_WORDS, MAX_IO_WORDS);
+            let words = min(rlen / WORD_SIZE as u32, MAX_IO_WORDS);
             // tracing::trace!("body: {words}");
             for j in 0..MAX_IO_WORDS {
                 if j < words {
@@ -376,6 +380,7 @@ impl<'a, T: Risc0Context> Risc0Machine<'a, T> {
         Ok(())
     }
 
+    #[inline(always)]
     fn store_u8(&mut self, addr: ByteAddr, byte: u8) -> Result<()> {
         let byte_offset = addr.subaddr() as usize;
         let word = self.load_memory(addr.waddr())?;
@@ -385,6 +390,7 @@ impl<'a, T: Risc0Context> Risc0Machine<'a, T> {
         self.store_memory(addr.waddr(), word)
     }
 
+    #[inline(always)]
     fn regs_base_addr(&self) -> WordAddr {
         if self.is_machine_mode() {
             MACHINE_REGS_ADDR.waddr()
@@ -496,21 +502,25 @@ impl<T: Risc0Context> EmuContext for Risc0Machine<'_, T> {
         self.ctx.store_u32(addr, word)
     }
 
+    #[inline(always)]
     fn check_insn_load(&self, addr: ByteAddr) -> bool {
         !(addr < ZERO_PAGE_END_ADDR || (!self.is_machine_mode() && addr >= KERNEL_START_ADDR))
     }
 
+    #[inline(always)]
     fn check_data_load(&self, addr: ByteAddr) -> bool {
         // self.is_machine_mode() || is_user_memory(addr)
         addr >= ZERO_PAGE_END_ADDR && self.is_machine_mode() || is_user_memory(addr)
         // self.check_insn_load(addr)
     }
 
+    #[inline(always)]
     fn check_data_store(&self, addr: ByteAddr) -> bool {
         self.check_data_load(addr)
     }
 }
 
+#[inline]
 pub(crate) fn guest_addr(addr: u32) -> Result<ByteAddr> {
     let addr = ByteAddr(addr);
     if addr < ZERO_PAGE_END_ADDR {

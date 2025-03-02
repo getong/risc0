@@ -3854,6 +3854,7 @@ dependencies = [
  "malachite",
  "num-derive",
  "num-traits",
+ "num_cpus",
  "paste",
  "rand",
  "rayon",

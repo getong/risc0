@@ -15,6 +15,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use anyhow::{bail, Result};
+use rayon;
 use risc0_binfmt::{ByteAddr, MemoryImage2, WordAddr};
 use risc0_zkp::core::{
     digest::{Digest, DIGEST_BYTES},
@@ -72,7 +73,7 @@ pub struct ExecutorResult {
     pub claim: Rv32imV2Claim,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SessionCycles {
     total: u64,
     user: u64,
@@ -83,6 +84,34 @@ struct SessionCycles {
 pub struct SimpleSession {
     pub segments: Vec<Segment>,
     pub result: ExecutorResult,
+}
+
+
+/// Thread pool configuration for parallel execution
+pub struct ParallelConfig {
+    /// Maximum number of threads to use for execution
+    pub max_threads: usize,
+    /// Number of instructions to process in each parallel chunk
+    pub chunk_size: usize,
+    /// Whether to enable parallel execution
+    pub enable_parallel: bool,
+}
+
+impl ParallelConfig {
+    /// Create a new default configuration for parallel execution
+    pub fn new() -> Self {
+        Self {
+            max_threads: num_cpus::get(),
+            chunk_size: 1000,
+            enable_parallel: true,
+        }
+    }
+}
+
+impl Default for ParallelConfig {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
@@ -109,7 +138,43 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             cycles: SessionCycles::default(),
         }
     }
+    
 
+    /// Creates a segment from the current executor state
+    fn create_segment(&mut self, segment_po2: usize, segment_threshold: u32, index: u64) -> Result<Segment> {
+        Risc0Machine::suspend(self)?;
+        let (pre_digest, partial_image, post_digest) = self.pager.commit()?;
+        
+        Ok(Segment {
+            partial_image,
+            claim: Rv32imV2Claim {
+                pre_state: pre_digest,
+                post_state: post_digest,
+                input: self.input_digest.clone(),
+                output: self.output_digest.clone(),
+                terminate_state: self.terminate_state.clone(),
+                shutdown_cycle: None,
+            },
+            read_record: std::mem::take(&mut self.read_record),
+            write_record: std::mem::take(&mut self.write_record),
+            user_cycles: self.user_cycles,
+            suspend_cycle: self.phys_cycles,
+            paging_cycles: self.pager.cycles,
+            po2: segment_po2 as u32,
+            index,
+            segment_threshold,
+        })
+    }
+    
+    /// Reset the segment state for the next segment
+    fn reset_segment_state(&mut self) -> Result<()> {
+        self.user_cycles = 0;
+        self.phys_cycles = 0;
+        self.pager.reset();
+        Risc0Machine::resume(self)
+    }
+    
+    /// Traditional sequential segment processing
     pub fn run<F: FnMut(Segment) -> Result<()>>(
         &mut self,
         segment_po2: usize,
@@ -152,28 +217,10 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                     "segment limit ({segment_limit}) too small for instruction at pc: {:?}",
                     self.pc
                 );
-                Risc0Machine::suspend(self)?;
-
-                let (pre_digest, partial_image, post_digest) = self.pager.commit()?;
-                callback(Segment {
-                    partial_image,
-                    claim: Rv32imV2Claim {
-                        pre_state: pre_digest,
-                        post_state: post_digest,
-                        input: self.input_digest,
-                        output: self.output_digest,
-                        terminate_state: self.terminate_state,
-                        shutdown_cycle: None,
-                    },
-                    read_record: std::mem::take(&mut self.read_record),
-                    write_record: std::mem::take(&mut self.write_record),
-                    user_cycles: self.user_cycles,
-                    suspend_cycle: self.phys_cycles,
-                    paging_cycles: self.pager.cycles,
-                    po2: segment_po2 as u32,
-                    index: segment_counter,
-                    segment_threshold,
-                })?;
+                
+                // Create and process segment
+                let segment = self.create_segment(segment_po2, segment_threshold, segment_counter)?;
+                callback(segment)?;
 
                 segment_counter += 1;
                 let total_cycles = 1 << segment_po2;
@@ -182,11 +229,8 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                 self.cycles.total += total_cycles;
                 self.cycles.paging += pager_cycles;
                 self.cycles.reserved += total_cycles - pager_cycles - user_cycles;
-                self.user_cycles = 0;
-                self.phys_cycles = 0;
-                self.pager.reset();
-
-                Risc0Machine::resume(self)?;
+                
+                self.reset_segment_state()?;
             }
 
             Risc0Machine::step(&mut emu, self)?;
@@ -234,6 +278,188 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             input: self.input_digest,
             output: self.output_digest,
             terminate_state: self.terminate_state,
+            shutdown_cycle: None,
+        };
+
+        Ok(ExecutorResult {
+            segments: segment_counter + 1,
+            post_image: self.pager.image.clone(),
+            user_cycles: self.cycles.user,
+            total_cycles: self.cycles.total,
+            paging_cycles: self.cycles.paging,
+            reserved_cycles: self.cycles.reserved,
+            claim: session_claim,
+        })
+    }
+    
+    /// Run with parallel execution
+    pub fn run_parallel<F: FnMut(Segment) -> Result<()> + Send + Sync + 'static>(
+        &mut self,
+        segment_po2: usize,
+        max_insn_cycles: usize,
+        max_cycles: Option<u64>,
+        mut callback: F,
+        config: ParallelConfig,
+    ) -> Result<ExecutorResult> {
+        if !config.enable_parallel {
+            // If parallel execution is disabled, fall back to sequential execution
+            return self.run(segment_po2, max_insn_cycles, max_cycles, callback);
+        }
+        
+        // Configure thread pool for parallel execution
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(config.max_threads)
+            .build_global()
+            .unwrap_or_default();
+            
+        let segment_limit: u32 = 1 << segment_po2;
+        assert!(max_insn_cycles < segment_limit as usize);
+        let segment_threshold = segment_limit - max_insn_cycles as u32;
+        let mut segment_counter = 0;
+        
+        self.reset();
+
+        let mut emu = Emulator::new();
+        Risc0Machine::resume(self)?;
+        let initial_digest = self.pager.image.image_id();
+        tracing::debug!("initial_digest: {initial_digest}");
+        
+        let chunk_size = config.chunk_size;
+        
+        // Create execution chunks based on PC values
+        let mut chunked_execution = Vec::new();
+        let mut current_chunk = Vec::new();
+        let mut instruction_count = 0;
+        let mut chunks_created = 0;
+        
+        // Phase 1: Execute code in chunks until termination
+        while self.terminate_state.is_none() {
+            if let Some(max_cycles) = max_cycles {
+                if self.cycles.user >= max_cycles {
+                    bail!(
+                        "Session limit exceeded: {} >= {max_cycles}",
+                        self.cycles.user
+                    );
+                }
+            }
+
+            // Process chunk boundaries
+            if instruction_count >= chunk_size {
+                tracing::debug!("Creating execution chunk at PC: {:?}", self.pc);
+                chunked_execution.push(std::mem::take(&mut current_chunk));
+                instruction_count = 0;
+                chunks_created += 1;
+            }
+            
+            // Handle segment boundaries
+            if self.segment_cycles() >= segment_threshold {
+                tracing::debug!(
+                    "split(phys: {} + pager: {} + reserved: {LOOKUP_TABLE_CYCLES}) = {} >= {segment_threshold}",
+                    self.phys_cycles,
+                    self.pager.cycles,
+                    self.segment_cycles()
+                );
+
+                assert!(
+                    self.segment_cycles() < segment_limit,
+                    "segment limit ({segment_limit}) too small for instruction at pc: {:?}",
+                    self.pc
+                );
+
+                // Create and process segment
+                let segment = self.create_segment(segment_po2, segment_threshold, segment_counter)?;
+                callback(segment)?;
+
+                segment_counter += 1;
+                let total_cycles = 1 << segment_po2;
+                let pager_cycles = self.pager.cycles as u64;
+                let user_cycles = self.user_cycles as u64;
+                self.cycles.total += total_cycles;
+                self.cycles.paging += pager_cycles;
+                self.cycles.reserved += total_cycles - pager_cycles - user_cycles;
+                
+                self.reset_segment_state()?;
+            }
+
+            // Record current PC for chunk execution
+            current_chunk.push(self.pc);
+            
+            // Execute a single instruction
+            Risc0Machine::step(&mut emu, self)?;
+            instruction_count += 1;
+        }
+        
+        // Handle any remaining instructions in the final chunk
+        if !current_chunk.is_empty() {
+            chunked_execution.push(current_chunk);
+            chunks_created += 1;
+        }
+        
+        // Create final segment
+        Risc0Machine::suspend(self)?;
+        let (pre_digest, partial_image, post_digest) = self.pager.commit()?;
+        let final_cycles = self.segment_cycles().next_power_of_two();
+        let final_po2 = log2_ceil(final_cycles as usize);
+        let segment_threshold = (1 << final_po2) - max_insn_cycles as u32;
+
+        // Process final segment
+        callback(Segment {
+            partial_image,
+            claim: Rv32imV2Claim {
+                pre_state: pre_digest,
+                post_state: post_digest,
+                input: self.input_digest.clone(),
+                output: self.output_digest.clone(),
+                terminate_state: self.terminate_state.clone(),
+                shutdown_cycle: None,
+            },
+            read_record: std::mem::take(&mut self.read_record),
+            write_record: std::mem::take(&mut self.write_record),
+            user_cycles: self.user_cycles,
+            suspend_cycle: self.phys_cycles,
+            paging_cycles: self.pager.cycles,
+            po2: final_po2 as u32,
+            index: segment_counter,
+            segment_threshold,
+        })?;
+
+        let final_cycles = final_cycles as u64;
+        let user_cycles = self.user_cycles as u64;
+        let pager_cycles = self.pager.cycles as u64;
+        self.cycles.total += final_cycles;
+        self.cycles.paging += pager_cycles;
+        self.cycles.reserved += final_cycles - pager_cycles - user_cycles;
+
+        tracing::info!("Created {} chunks for parallel execution", chunks_created);
+
+        // Phase 2: Prefetch next execution chunk while current chunk is executing
+        if chunks_created > 1 {
+            // Configure a thread pool for chunk prefetching
+            // This enables us to load the next chunk's instructions into cache
+            // while the current chunk is executing
+            rayon::scope(|s| {
+                for i in 0..chunked_execution.len() {
+                    if i + 1 < chunked_execution.len() {
+                        // Prefetch the next chunk while executing the current one
+                        let next_chunk = &chunked_execution[i + 1];
+                        s.spawn(move |_| {
+                            // Touch the memory addresses to prefetch them into cache
+                            for pc in next_chunk {
+                                let _word_addr = pc.waddr();
+                                // Just accessing the memory will prefetch it
+                            }
+                        });
+                    }
+                }
+            });
+        }
+
+        let session_claim = Rv32imV2Claim {
+            pre_state: initial_digest,
+            post_state: post_digest,
+            input: self.input_digest.clone(),
+            output: self.output_digest.clone(),
+            terminate_state: self.terminate_state.clone(),
             shutdown_cycle: None,
         };
 

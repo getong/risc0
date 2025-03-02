@@ -21,6 +21,7 @@ derive_more = { version = "2.0.1", default-features = false, features = [
 ] }
 paste = "1.0"
 branch_hints = "0.4.11"
+num_cpus = "1.15"
 risc0-binfmt = { workspace = true }
 risc0-core = { workspace = true }
 risc0-zkp = { workspace = true, default-features = false }

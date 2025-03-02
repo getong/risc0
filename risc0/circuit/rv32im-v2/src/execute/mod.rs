@@ -15,7 +15,7 @@
 pub(crate) mod bibc;
 pub(crate) mod bigint;
 pub(crate) mod byte_poly;
-mod executor;
+pub mod executor;
 pub(crate) mod pager;
 pub mod platform;
 pub(crate) mod poseidon2;
