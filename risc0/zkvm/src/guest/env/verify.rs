@@ -88,7 +88,7 @@ pub fn verify_integrity(claim: &ReceiptClaim) -> Result<(), VerifyIntegrityError
         .output
         .as_value()?
         .as_ref()
-        .map_or(true, |output| output.assumptions.is_empty());
+        .is_none_or(|output| output.assumptions.is_empty());
 
     if !assumptions_empty {
         return Err(VerifyIntegrityError::NonEmptyAssumptionsList);

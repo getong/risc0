@@ -336,7 +336,7 @@ fn insn_b(imm: u32, rs2: u32, rs1: u32, funct3: u32, opcode: u32) -> u32 {
 // 31                                   12 | 11        7 | 6    0 |
 //    imm[31:12]                           |      rd     | opcode |
 fn insn_u(imm: u32, rd: u32, opcode: u32) -> u32 {
-    ((imm << 12) | (rd << 7) | opcode)
+    (imm << 12) | (rd << 7) | opcode
 }
 
 fn fence() -> u32 {

@@ -154,11 +154,12 @@ fn main() {
             env::commit(&digest);
         }
         MultiTestSpec::ShaDigestIter { data, num_iter } => {
-            let mut hash = &data[..];
+            let mut hash_data = data.to_vec(); // Create owned copy
             for _ in 0..num_iter {
-                hash = sha::Impl::hash_bytes(hash).as_bytes();
+                let digest = sha::Impl::hash_bytes(&hash_data);
+                hash_data = digest.as_bytes().to_vec();
             }
-            env::commit(&Digest::try_from(hash).unwrap())
+            env::commit(&Digest::try_from(&hash_data[..]).unwrap())
         }
         MultiTestSpec::Syscall { count } => {
             let mut input: &[u8] = &[];
