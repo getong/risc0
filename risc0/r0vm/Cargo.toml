@@ -9,7 +9,7 @@ repository = { workspace = true }
 
 [dependencies]
 bincode = "1.3"
-bytemuck = "1.12"
+bytemuck = "1.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 risc0-zkvm = { workspace = true, features = ["prove"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -17,7 +17,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 anyhow = "1.0"
 assert_cmd = "2.0"
-assert_fs = "1.0"
+assert_fs = "1.1"
 risc0-zkvm-methods = { path = "../zkvm/methods" }
 temp-env = "0.3"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
