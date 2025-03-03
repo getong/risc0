@@ -58,6 +58,15 @@ pub struct Executor2<'a> {
 }
 
 impl<'a> Executor2<'a> {
+    /// Creates a ParallelConfig based on ExecutorEnv settings
+    fn create_parallel_config(&self) -> risc0_circuit_rv32im_v2::execute::ParallelConfig {
+        use risc0_circuit_rv32im_v2::execute::ParallelConfig;
+        
+        // TODO: Add parallel execution settings to ExecutorEnv
+        // For now, use default parallel configuration
+        ParallelConfig::new()
+    }
+
     /// Construct a new [Executor2] from a [MemoryImage2] and entry point.
     ///
     /// Before a guest program is proven, the [Executor2] is responsible for
@@ -133,14 +142,17 @@ impl<'a> Executor2<'a> {
         }
 
         let path = self.env.segment_path.clone().unwrap();
-        self.run_with_callback(|segment| Ok(Box::new(FileSegmentRef::new(&segment, &path)?)))
+        let callback = move |segment| Ok(Box::new(FileSegmentRef::new(&segment, &path)?));
+        self.run_with_callback(callback)
     }
 
     /// Run the executor until [crate::ExitCode::Halted] or
     /// [crate::ExitCode::Paused] is reached, producing a [Session] as a result.
+    /// 
+    /// This uses parallel execution capabilities for improved performance on long workloads.
     pub fn run_with_callback<F>(&mut self, mut callback: F) -> Result<Session>
     where
-        F: FnMut(Segment) -> Result<Box<dyn SegmentRef>>,
+        F: FnMut(Segment) -> Result<Box<dyn SegmentRef>> + Send + Sync + 'static,
     {
         scope!("execute");
         tracing::info!("Executing rv32im-v2 session");
@@ -165,7 +177,11 @@ impl<'a> Executor2<'a> {
         );
 
         let start_time = Instant::now();
-        let result = exec.run(
+        
+        // Create parallel config based on ExecutorEnv settings
+        let parallel_config = self.create_parallel_config();
+        
+        let result = exec.run_parallel(
             segment_limit_po2,
             MAX_INSN_CYCLES,
             self.env.session_limit,
@@ -208,6 +224,7 @@ impl<'a> Executor2<'a> {
                 refs.push(segment_ref);
                 Ok(())
             },
+            parallel_config,
         )?;
         let elapsed = start_time.elapsed();
 

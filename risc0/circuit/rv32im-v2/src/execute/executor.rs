@@ -129,6 +129,8 @@ pub struct ParallelConfig {
     pub chunk_size: usize,
     /// Whether to enable parallel execution
     pub enable_parallel: bool,
+    /// Report progress during long executions
+    pub report_progress: bool,
 }
 
 impl ParallelConfig {
@@ -138,6 +140,27 @@ impl ParallelConfig {
             max_threads: 10,
             chunk_size: 1000,
             enable_parallel: true,
+            report_progress: false,
+        }
+    }
+    
+    /// Create an optimized configuration for high performance on large workloads (100M-500M cycles)
+    pub fn high_performance() -> Self {
+        Self {
+            max_threads: 16,
+            chunk_size: 5000,
+            enable_parallel: true,
+            report_progress: true,
+        }
+    }
+    
+    /// Create a configuration optimized for extreme workloads (500M+ cycles)
+    pub fn extreme_workload() -> Self {
+        Self {
+            max_threads: 24,
+            chunk_size: 10000,
+            enable_parallel: true,
+            report_progress: true,
         }
     }
 }
@@ -145,6 +168,63 @@ impl ParallelConfig {
 impl Default for ParallelConfig {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Callback trait for monitoring parallel execution
+pub trait ParallelExecutionCallback: Send + Sync {
+    /// Called when progress is reported
+    fn on_progress(&self, cycles: u64, chunks: u64, elapsed: std::time::Duration);
+    
+    /// Called when execution completes
+    fn on_complete(&self, cycles: u64, chunks: u64, elapsed: std::time::Duration);
+}
+
+/// Simple progress callback implementation
+pub struct ProgressCallback {
+    /// Whether to log progress to tracing
+    pub log_progress: bool,
+    /// Whether to log completion to tracing
+    pub log_completion: bool,
+}
+
+impl ProgressCallback {
+    /// Create a new progress callback with default settings
+    pub fn new() -> Self {
+        Self {
+            log_progress: true,
+            log_completion: true,
+        }
+    }
+}
+
+impl Default for ProgressCallback {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ParallelExecutionCallback for ProgressCallback {
+    fn on_progress(&self, cycles: u64, chunks: u64, elapsed: std::time::Duration) {
+        if self.log_progress {
+            tracing::info!(
+                "Progress: executed {} chunks, {} cycles, elapsed time: {:?}",
+                chunks,
+                cycles,
+                elapsed
+            );
+        }
+    }
+    
+    fn on_complete(&self, cycles: u64, chunks: u64, elapsed: std::time::Duration) {
+        if self.log_completion {
+            tracing::info!(
+                "Completed parallel execution: {} chunks, {} cycles, elapsed time: {:?}",
+                chunks,
+                cycles,
+                elapsed
+            );
+        }
     }
 }
 
@@ -448,9 +528,41 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         segment_po2: usize,
         max_insn_cycles: usize,
         max_cycles: Option<u64>,
-        mut callback: F,
+        callback: F,
         config: ParallelConfig,
     ) -> Result<ExecutorResult> {
+        // Create default progress callback based on config
+        let progress_callback = if config.report_progress {
+            Some(ProgressCallback::new())
+        } else {
+            None
+        };
+        
+        // Delegate to the more flexible implementation
+        self.run_parallel_with_callbacks(
+            segment_po2,
+            max_insn_cycles,
+            max_cycles,
+            callback,
+            config,
+            progress_callback,
+        )
+    }
+
+    /// Run with parallel execution and optional progress tracking
+    pub fn run_parallel_with_callbacks<F, C>(
+        &mut self,
+        segment_po2: usize,
+        max_insn_cycles: usize,
+        max_cycles: Option<u64>,
+        mut callback: F,
+        config: ParallelConfig,
+        progress_callback: Option<C>,
+    ) -> Result<ExecutorResult> 
+    where
+        F: FnMut(Segment) -> Result<()> + Send + Sync + 'static,
+        C: ParallelExecutionCallback + 'static,
+    {
         if !config.enable_parallel {
             // If parallel execution is disabled, fall back to sequential execution
             return self.run(segment_po2, max_insn_cycles, max_cycles, callback);
@@ -477,6 +589,11 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         let mut terminate_detected = false;
         let chunk_size = config.chunk_size;
         let mut total_chunks_executed = 0;
+        let progress_interval = 10000; // Report progress every 10000 chunks
+        let start_time = std::time::Instant::now();
+        
+        // Whether we should report progress
+        let has_progress_callback = progress_callback.is_some();
 
         // Create a persistent null syscall handler for thread executors
         let null_syscall = Arc::new(NullSyscall {});
@@ -582,6 +699,15 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                 // so we just need to continue with the next iteration
                 tracing::debug!("Skipping parallel execution for small single chunk");
                 total_chunks_executed += 1;
+                
+                // Report progress for long-running workloads
+                if has_progress_callback && total_chunks_executed % progress_interval == 0 {
+                    let elapsed = start_time.elapsed();
+                    if let Some(callback) = &progress_callback {
+                        callback.on_progress(self.cycles.user, total_chunks_executed, elapsed);
+                    }
+                }
+                
                 continue;
             }
 
@@ -709,6 +835,14 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
 
                     self.reset_segment_state()?;
                 }
+                
+                // Report progress for parallel execution
+                if has_progress_callback && total_chunks_executed % progress_interval == 0 {
+                    let elapsed = start_time.elapsed();
+                    if let Some(callback) = &progress_callback {
+                        callback.on_progress(self.cycles.user, total_chunks_executed, elapsed);
+                    }
+                }
             } else {
                 // Single chunk - already executed during exploration
                 total_chunks_executed += 1;
@@ -763,10 +897,14 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             shutdown_cycle: None,
         };
 
-        tracing::info!(
-            "Executed {} chunks in parallel execution",
-            total_chunks_executed
-        );
+        let total_elapsed = start_time.elapsed();
+        
+        // Report completion
+        if has_progress_callback {
+            if let Some(callback) = &progress_callback {
+                callback.on_complete(self.cycles.user, total_chunks_executed, total_elapsed);
+            }
+        }
 
         Ok(ExecutorResult {
             segments: segment_counter + 1,
