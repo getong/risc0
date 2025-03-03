@@ -4857,6 +4857,7 @@ dependencies = [
  "mini-redis",
  "num-bigint 0.4.6",
  "num-traits",
+ "num_cpus",
  "postcard",
  "prost 0.13.4",
  "puffin",

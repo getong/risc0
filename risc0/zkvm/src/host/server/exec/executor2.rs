@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -26,7 +26,7 @@ use risc0_circuit_rv32im_v2::{
         platform::WORD_SIZE, Executor, Syscall as CircuitSyscall,
         SyscallContext as CircuitSyscallContext, DEFAULT_SEGMENT_LIMIT_PO2, USER_END_ADDR,
     },
-    MAX_INSN_CYCLES,
+    ParallelConfig, MAX_INSN_CYCLES,
 };
 use risc0_core::scope;
 use risc0_zkos_v1compat::V1COMPAT_ELF;
@@ -59,12 +59,33 @@ pub struct Executor2<'a> {
 
 impl<'a> Executor2<'a> {
     /// Creates a ParallelConfig based on ExecutorEnv settings
-    fn create_parallel_config(&self) -> risc0_circuit_rv32im_v2::execute::ParallelConfig {
-        use risc0_circuit_rv32im_v2::execute::ParallelConfig;
+    fn create_parallel_config(&self) -> risc0_circuit_rv32im_v2::ParallelConfig {
+        // Get number of CPUs to optimize thread count
+        let num_cpus = num_cpus::get();
         
-        // TODO: Add parallel execution settings to ExecutorEnv
-        // For now, use default parallel configuration
-        ParallelConfig::new()
+        // Check if we should use a high-performance or extreme configuration
+        // This could be based on environment variables or expected workload size
+        if let Some(expected_cycles) = self.env.expected_cycles {
+            if expected_cycles > 500_000_000 {
+                // For extremely large workloads (500M+ cycles)
+                let mut config = ParallelConfig::extreme_workload();
+                // Limit threads to number of CPUs
+                config.max_threads = num_cpus.min(config.max_threads);
+                return config;
+            } else if expected_cycles > 100_000_000 {
+                // For large workloads (100M-500M cycles)
+                let mut config = ParallelConfig::high_performance();
+                // Limit threads to number of CPUs
+                config.max_threads = num_cpus.min(config.max_threads);
+                return config;
+            }
+        }
+        
+        // Default configuration for normal workloads
+        let mut config = ParallelConfig::new();
+        // Limit threads to number of CPUs
+        config.max_threads = num_cpus.min(config.max_threads);
+        config
     }
 
     /// Construct a new [Executor2] from a [MemoryImage2] and entry point.
@@ -97,6 +118,7 @@ impl<'a> Executor2<'a> {
         let image = MemoryImage2::with_kernel(program, kernel);
 
         let profiler = if env.pprof_out.is_some() {
+            // Note: We still use Rc<RefCell> for profiler since it's not used in the parallel execution path
             let profiler = Rc::new(RefCell::new(Profiler::new(
                 user_elf,
                 None,
@@ -142,26 +164,26 @@ impl<'a> Executor2<'a> {
         }
 
         let path = self.env.segment_path.clone().unwrap();
-        let callback = move |segment| Ok(Box::new(FileSegmentRef::new(&segment, &path)?));
+        let callback = move |segment| -> Result<Box<dyn SegmentRef>> {
+            Ok(Box::new(FileSegmentRef::new(&segment, &path)?) as Box<dyn SegmentRef>)
+        };
         self.run_with_callback(callback)
     }
 
     /// Run the executor until [crate::ExitCode::Halted] or
     /// [crate::ExitCode::Paused] is reached, producing a [Session] as a result.
-    /// 
+    ///
     /// This uses parallel execution capabilities for improved performance on long workloads.
     pub fn run_with_callback<F>(&mut self, mut callback: F) -> Result<Session>
     where
-        F: FnMut(Segment) -> Result<Box<dyn SegmentRef>> + Send + Sync + 'static,
+        F: FnMut(Segment) -> Result<Box<dyn SegmentRef>>,
     {
         scope!("execute");
         tracing::info!("Executing rv32im-v2 session");
 
         let journal = Journal::default();
-        self.env
-            .posix_io
-            .borrow_mut()
-            .with_write_fd(fileno::JOURNAL, journal.clone());
+        let mut posix_io = self.env.posix_io.borrow_mut();
+        posix_io.with_write_fd(fileno::JOURNAL, journal.clone());
 
         let segment_limit_po2 = self
             .env
@@ -177,7 +199,7 @@ impl<'a> Executor2<'a> {
         );
 
         let start_time = Instant::now();
-        
+
         // Create parallel config based on ExecutorEnv settings
         let parallel_config = self.create_parallel_config();
         
@@ -195,7 +217,10 @@ impl<'a> Executor2<'a> {
                             .claim
                             .output
                             .and_then(|digest| {
-                                (digest != Digest::ZERO).then(|| journal.buf.borrow().clone())
+                                (digest != Digest::ZERO).then(|| {
+                                    let current_journal = journal.buf.lock().unwrap();
+                                    current_journal.clone()
+                                })
                             })
                             .map(|journal| {
                                 Ok(Output {
@@ -203,7 +228,8 @@ impl<'a> Executor2<'a> {
                                     assumptions: Assumptions(
                                         self.syscall_table
                                             .assumptions_used
-                                            .borrow()
+                                            .lock()
+                                            .unwrap()
                                             .iter()
                                             .map(|(a, _)| a.clone().into())
                                             .collect::<Vec<_>>(),
@@ -233,23 +259,25 @@ impl<'a> Executor2<'a> {
         let exit_code = exit_code_from_rv32im_v2_claim(&result.claim)?;
 
         // Set the session_journal to the committed data iff the guest set a non-zero output.
-        let session_journal = result
-            .claim
-            .output
-            .and_then(|digest| (digest != Digest::ZERO).then(|| journal.buf.take()));
+        let session_journal = result.claim.output.and_then(|digest| {
+            (digest != Digest::ZERO).then(|| {
+                let current_journal = journal.buf.lock().unwrap();
+                current_journal.clone()
+            })
+        });
         if !exit_code.expects_output() && session_journal.is_some() {
             tracing::debug!(
                 "dropping non-empty journal due to exit code {exit_code:?}: 0x{}",
-                hex::encode(journal.buf.borrow().as_slice())
+                hex::encode(session_journal.unwrap().as_slice())
             );
         };
 
         // Take (clear out) the list of accessed assumptions.
         // Leave the assumptions cache so it can be used if execution is resumed from pause.
-        let assumptions = self.syscall_table.assumptions_used.take();
-        let mmr_assumptions = self.syscall_table.mmr_assumptions.take();
-        let pending_zkrs = self.syscall_table.pending_zkrs.take();
-        let pending_keccaks = self.syscall_table.pending_keccaks.take();
+        let assumptions = std::mem::take(&mut *self.syscall_table.assumptions_used.lock().unwrap());
+        let mmr_assumptions = std::mem::take(&mut *self.syscall_table.mmr_assumptions.lock().unwrap());
+        let pending_zkrs = std::mem::take(&mut *self.syscall_table.pending_zkrs.lock().unwrap());
+        let pending_keccaks = std::mem::take(&mut *self.syscall_table.pending_keccaks.lock().unwrap());
 
         if let Some(profiler) = self.profiler.take() {
             let report = profiler.borrow_mut().finalize_to_vec();
@@ -257,7 +285,7 @@ impl<'a> Executor2<'a> {
         }
 
         self.image = result.post_image.clone();
-        let syscall_metrics = self.syscall_table.metrics.borrow().clone();
+        let syscall_metrics = self.syscall_table.metrics.lock().unwrap().clone();
 
         // NOTE: When a segment ends in a Halted(_) state, the post_digest will be null.
         let post_digest = match exit_code {
@@ -302,6 +330,10 @@ struct ContextAdapter<'a, 'b> {
     ctx: &'b mut dyn CircuitSyscallContext,
     syscall_table: SyscallTable<'a>,
 }
+
+// Implement Send and Sync since the trait now requires it
+unsafe impl<'a, 'b> Send for ContextAdapter<'a, 'b> {}
+unsafe impl<'a, 'b> Sync for ContextAdapter<'a, 'b> {}
 
 impl<'a> SyscallContext<'a> for ContextAdapter<'a, '_> {
     fn get_pc(&self) -> u32 {
@@ -364,7 +396,8 @@ impl CircuitSyscall for Executor2<'_> {
             self.syscall_table
                 .get_syscall(&syscall)
                 .context(format!("Unknown syscall: {syscall:?}"))?
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .syscall(&syscall, &mut ctx, &mut to_guest)?,
         );
 

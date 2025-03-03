@@ -145,7 +145,7 @@ impl Segment {
 /// This allows implementers to determine the best way to represent this in an
 /// pluggable manner. See the [SimpleSegmentRef] for a very basic
 /// implementation.
-pub trait SegmentRef: Send {
+pub trait SegmentRef: Send + Sync {
     /// Resolve this reference into an actual [Segment].
     fn resolve(&self) -> Result<Segment>;
 }

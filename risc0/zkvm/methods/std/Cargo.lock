@@ -1412,6 +1412,7 @@ dependencies = [
  "derive_more",
  "getrandom",
  "hex",
+ "num_cpus",
  "risc0-binfmt",
  "risc0-circuit-keccak",
  "risc0-circuit-recursion",

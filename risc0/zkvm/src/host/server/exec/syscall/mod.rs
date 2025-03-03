@@ -29,7 +29,7 @@ mod slice_io;
 mod verify;
 mod verify2;
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{collections::HashMap, sync::{Arc, Mutex}};
 
 use anyhow::{anyhow, Result};
 use enum_map::{Enum, EnumMap};
@@ -59,7 +59,7 @@ use self::{
 };
 
 /// A host-side implementation of a system call.
-pub(crate) trait Syscall {
+pub(crate) trait Syscall: Send + Sync {
     /// Invokes the system call.
     fn syscall(
         &mut self,
@@ -71,7 +71,7 @@ pub(crate) trait Syscall {
 
 /// Access to memory and machine state for syscalls.
 #[allow(dead_code)]
-pub(crate) trait SyscallContext<'a> {
+pub(crate) trait SyscallContext<'a>: Send + Sync {
     /// Returns the current program counter.
     fn get_pc(&self) -> u32;
 
@@ -131,29 +131,29 @@ pub(crate) struct SyscallMetric {
 
 #[derive(Clone)]
 pub(crate) struct SyscallTable<'a> {
-    pub(crate) inner: HashMap<String, Rc<RefCell<dyn Syscall + 'a>>>,
-    pub(crate) posix_io: Rc<RefCell<PosixIo<'a>>>,
-    pub(crate) assumptions: Rc<RefCell<AssumptionReceipts>>,
-    pub(crate) assumptions_used: Rc<RefCell<AssumptionUsage>>,
-    pub(crate) mmr_assumptions: Rc<RefCell<Vec<AssumptionReceipt>>>,
+    pub(crate) inner: HashMap<String, Arc<Mutex<dyn Syscall + 'a>>>,
+    pub(crate) posix_io: Arc<Mutex<PosixIo<'a>>>,
+    pub(crate) assumptions: Arc<Mutex<AssumptionReceipts>>,
+    pub(crate) assumptions_used: Arc<Mutex<AssumptionUsage>>,
+    pub(crate) mmr_assumptions: Arc<Mutex<Vec<AssumptionReceipt>>>,
     pub(crate) coprocessor: Option<CoprocessorCallbackRef<'a>>,
-    pub(crate) pending_zkrs: Rc<RefCell<Vec<ProveZkrRequest>>>,
-    pub(crate) pending_keccaks: Rc<RefCell<Vec<ProveKeccakRequest>>>,
-    pub(crate) metrics: Rc<RefCell<EnumMap<SyscallKind, SyscallMetric>>>,
+    pub(crate) pending_zkrs: Arc<Mutex<Vec<ProveZkrRequest>>>,
+    pub(crate) pending_keccaks: Arc<Mutex<Vec<ProveKeccakRequest>>>,
+    pub(crate) metrics: Arc<Mutex<EnumMap<SyscallKind, SyscallMetric>>>,
 }
 
 impl<'a> SyscallTable<'a> {
     pub fn new(env: &ExecutorEnv<'a>) -> Self {
         Self {
             inner: Default::default(),
-            posix_io: env.posix_io.clone(),
-            assumptions: env.assumptions.clone(),
-            assumptions_used: Default::default(),
-            mmr_assumptions: Default::default(),
+            posix_io: Arc::new(Mutex::new(env.posix_io.borrow().clone())),
+            assumptions: Arc::new(Mutex::new(env.assumptions.borrow().clone())),
+            assumptions_used: Arc::new(Mutex::new(Default::default())),
+            mmr_assumptions: Arc::new(Mutex::new(Default::default())),
             coprocessor: env.coprocessor.clone(),
-            pending_zkrs: Default::default(),
-            pending_keccaks: Default::default(),
-            metrics: Default::default(),
+            pending_zkrs: Arc::new(Mutex::new(Default::default())),
+            pending_keccaks: Arc::new(Mutex::new(Default::default())),
+            metrics: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -178,7 +178,7 @@ impl<'a> SyscallTable<'a> {
         for (syscall, handler) in env.slice_io.borrow().inner.iter() {
             let handler = SysSliceIo::new(handler.clone());
             this.inner
-                .insert(syscall.clone(), Rc::new(RefCell::new(handler)));
+                .insert(syscall.clone(), Arc::new(Mutex::new(handler)));
         }
 
         this
@@ -187,14 +187,14 @@ impl<'a> SyscallTable<'a> {
     pub(crate) fn with_syscall(
         &mut self,
         syscall: SyscallName,
-        handler: impl Syscall + 'a,
+        handler: impl Syscall + Send + Sync + 'a,
     ) -> &mut Self {
         self.inner
-            .insert(syscall.as_str().to_string(), Rc::new(RefCell::new(handler)));
+            .insert(syscall.as_str().to_string(), Arc::new(Mutex::new(handler)));
         self
     }
 
-    pub(crate) fn get_syscall(&self, name: &str) -> Option<&Rc<RefCell<(dyn Syscall + 'a)>>> {
+    pub(crate) fn get_syscall(&self, name: &str) -> Option<&Arc<Mutex<(dyn Syscall + 'a)>>> {
         self.inner.get(name)
     }
 }

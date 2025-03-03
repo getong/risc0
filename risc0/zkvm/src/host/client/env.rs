@@ -122,6 +122,8 @@ pub struct ExecutorEnv<'a> {
     pub(crate) keccak_max_po2: Option<u32>,
     pub(crate) segment_limit_po2: Option<u32>,
     pub(crate) session_limit: Option<u64>,
+    /// Used to predict workload size for optimizing parallel execution
+    pub(crate) expected_cycles: Option<u64>,
     pub(crate) posix_io: Rc<RefCell<PosixIo<'a>>>,
     pub(crate) slice_io: Rc<RefCell<SliceIoTable<'a>>>,
     pub(crate) input: Vec<u8>,
@@ -463,6 +465,17 @@ impl<'a> ExecutorEnvBuilder<'a> {
     /// Set the input digest.
     pub fn input_digest(&mut self, digest: Digest) -> &mut Self {
         self.inner.input_digest = Some(digest);
+        self
+    }
+    
+    /// Set the expected number of cycles for this workload
+    /// 
+    /// This allows the executor to optimize parallel execution for the workload size:
+    /// - Small workloads (<100M cycles): Standard parallel configuration
+    /// - Medium workloads (100M-500M cycles): High-performance configuration
+    /// - Large workloads (>500M cycles): Extreme workload configuration
+    pub fn expected_cycles(&mut self, cycles: u64) -> &mut Self {
+        self.inner.expected_cycles = Some(cycles);
         self
     }
 
