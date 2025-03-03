@@ -135,7 +135,7 @@ impl ParallelConfig {
     /// Create a new default configuration for parallel execution
     pub fn new() -> Self {
         Self {
-            max_threads: num_cpus::get(),
+            max_threads: 10,
             chunk_size: 1000,
             enable_parallel: true,
         }
