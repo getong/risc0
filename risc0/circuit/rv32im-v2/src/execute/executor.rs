@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cell::RefCell, rc::Rc, sync::{Arc, Mutex}};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{bail, Result};
 use rayon;
@@ -110,13 +114,12 @@ struct ChunkResult {
 /// Chunk execution status
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum ChunkStatus {
-    Success,        // Chunk executed successfully
+    Success,         // Chunk executed successfully
     SegmentBoundary, // Reached segment boundary
-    Termination,    // Program terminated
+    Termination,     // Program terminated
     #[allow(dead_code)]
-    Conflict,       // Memory conflict with another chunk (for future use)
+    Conflict, // Memory conflict with another chunk (for future use)
 }
-
 
 /// Thread pool configuration for parallel execution
 pub struct ParallelConfig {
@@ -147,14 +150,16 @@ impl Default for ParallelConfig {
 
 impl ExecutorState {
     /// Create a new executor state from the current executor
+    #[allow(clippy::needless_lifetimes)]
     fn capture<'a, 'b, S: Syscall>(executor: &mut Executor<'a, 'b, S>) -> Result<Self> {
         let mut registers = [0; REG_MAX];
-        
+
         // Capture user registers
+        #[allow(clippy::needless_range_loop)]
         for idx in 0..REG_MAX {
             registers[idx] = executor.peek_register(idx)?;
         }
-        
+
         Ok(Self {
             pc: executor.pc,
             user_pc: executor.user_pc,
@@ -162,11 +167,12 @@ impl ExecutorState {
             user_cycles: executor.user_cycles,
             phys_cycles: executor.phys_cycles,
             registers,
-            terminate_state: executor.terminate_state.clone(),
+            terminate_state: executor.terminate_state,
         })
     }
 }
 
+#[allow(clippy::needless_lifetimes)]
 impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
     pub fn new(
         image: MemoryImage2,
@@ -191,12 +197,12 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             cycles: SessionCycles::default(),
         }
     }
-    
+
     /// Capture current executor state
     fn capture_state(&mut self) -> Result<ExecutorState> {
         ExecutorState::capture(self)
     }
-    
+
     /// Apply a captured state to this executor
     fn apply_state(&mut self, state: &ExecutorState) -> Result<()> {
         self.pc = state.pc;
@@ -204,73 +210,66 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         self.machine_mode = state.machine_mode;
         self.user_cycles = state.user_cycles;
         self.phys_cycles = state.phys_cycles;
-        self.terminate_state = state.terminate_state.clone();
-        
+        self.terminate_state = state.terminate_state;
+
         // Apply registers
         let regs_addr = if state.machine_mode != 0 {
             MACHINE_REGS_ADDR.waddr()
         } else {
             USER_REGS_ADDR.waddr()
         };
-        
+
         for (idx, &reg) in state.registers.iter().enumerate() {
             self.store_u32(regs_addr + idx, reg)?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Execute a chunk of code in isolation with memory tracking
     fn execute_chunk(
-        &mut self, 
-        starting_pcs: &[ByteAddr], 
+        &mut self,
+        starting_pcs: &[ByteAddr],
         segment_threshold: u32,
     ) -> Result<(ChunkResult, ChunkStatus)> {
         // Capture initial state for this chunk
         let initial_state = self.capture_state()?;
-        
+
         // Track memory writes to detect conflicts
-        let memory_writes: Vec<(WordAddr, u32)> = Vec::new();
-        
-        // In a real implementation, we would track memory reads/writes to detect conflicts
-        // between parallel chunks of code, but this is simplified for now
-        
+        let memory_writes = Vec::new();
+
         // Save initial read/write records to append only new ones
         let initial_read_len = self.read_record.len();
         let initial_write_len = self.write_record.len();
-        
+
         // Execute the chunk instructions
         let mut emu = Emulator::new();
         let mut status = ChunkStatus::Success;
-        
-        for (_i, &pc) in starting_pcs.iter().enumerate() {
+
+        for &pc in starting_pcs.iter() {
             // Set PC to next instruction in the chunk
             self.pc = pc;
-            
+
             // Check for segment boundary
             if self.segment_cycles() >= segment_threshold {
                 status = ChunkStatus::SegmentBoundary;
                 break;
             }
-            
+
             // Execute one instruction
             Risc0Machine::step(&mut emu, self)?;
-            
-            // Track any memory read/write for this instruction (would be intercepted in a real impl)
-            // In a full implementation, we would override the load_u32 and store_u32 methods
-            // to capture addresses for conflict detection
-            
+
             // Check for termination
             if self.terminate_state.is_some() {
                 status = ChunkStatus::Termination;
                 break;
             }
         }
-        
+
         // Extract only the new reads and writes that happened during this chunk
         let read_record = self.read_record.split_off(initial_read_len);
         let write_record = self.write_record.split_off(initial_write_len);
-        
+
         // Create the chunk result
         let result = ChunkResult {
             state: self.capture_state()?,
@@ -278,27 +277,31 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             read_record,
             write_record,
         };
-        
+
         // Restore initial state (this chunk was executed speculatively)
         self.apply_state(&initial_state)?;
-        
+
         Ok((result, status))
     }
-    
 
     /// Creates a segment from the current executor state
-    fn create_segment(&mut self, segment_po2: usize, segment_threshold: u32, index: u64) -> Result<Segment> {
+    fn create_segment(
+        &mut self,
+        segment_po2: usize,
+        segment_threshold: u32,
+        index: u64,
+    ) -> Result<Segment> {
         Risc0Machine::suspend(self)?;
         let (pre_digest, partial_image, post_digest) = self.pager.commit()?;
-        
+
         Ok(Segment {
             partial_image,
             claim: Rv32imV2Claim {
                 pre_state: pre_digest,
                 post_state: post_digest,
-                input: self.input_digest.clone(),
-                output: self.output_digest.clone(),
-                terminate_state: self.terminate_state.clone(),
+                input: self.input_digest,
+                output: self.output_digest,
+                terminate_state: self.terminate_state,
                 shutdown_cycle: None,
             },
             read_record: std::mem::take(&mut self.read_record),
@@ -311,7 +314,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             segment_threshold,
         })
     }
-    
+
     /// Reset the segment state for the next segment
     fn reset_segment_state(&mut self) -> Result<()> {
         self.user_cycles = 0;
@@ -319,7 +322,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         self.pager.reset();
         Risc0Machine::resume(self)
     }
-    
+
     /// Traditional sequential segment processing
     pub fn run<F: FnMut(Segment) -> Result<()>>(
         &mut self,
@@ -363,9 +366,10 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                     "segment limit ({segment_limit}) too small for instruction at pc: {:?}",
                     self.pc
                 );
-                
+
                 // Create and process segment
-                let segment = self.create_segment(segment_po2, segment_threshold, segment_counter)?;
+                let segment =
+                    self.create_segment(segment_po2, segment_threshold, segment_counter)?;
                 callback(segment)?;
 
                 segment_counter += 1;
@@ -375,7 +379,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                 self.cycles.total += total_cycles;
                 self.cycles.paging += pager_cycles;
                 self.cycles.reserved += total_cycles - pager_cycles - user_cycles;
-                
+
                 self.reset_segment_state()?;
             }
 
@@ -437,7 +441,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             claim: session_claim,
         })
     }
-    
+
     /// Run with parallel execution
     pub fn run_parallel<F: FnMut(Segment) -> Result<()> + Send + Sync + 'static>(
         &mut self,
@@ -451,53 +455,58 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             // If parallel execution is disabled, fall back to sequential execution
             return self.run(segment_po2, max_insn_cycles, max_cycles, callback);
         }
-        
+
         // Configure thread pool for parallel execution
         rayon::ThreadPoolBuilder::new()
             .num_threads(config.max_threads)
             .build_global()
             .unwrap_or_default();
-            
+
         let segment_limit: u32 = 1 << segment_po2;
         assert!(max_insn_cycles < segment_limit as usize);
         let segment_threshold = segment_limit - max_insn_cycles as u32;
         let mut segment_counter = 0;
-        
+
         self.reset();
 
         let initial_digest = self.pager.image.image_id();
         tracing::debug!("initial_digest: {initial_digest}");
         Risc0Machine::resume(self)?;
-        
+
         // Execution state tracking
         let mut terminate_detected = false;
         let chunk_size = config.chunk_size;
         let mut total_chunks_executed = 0;
-        
+
+        // Create a persistent null syscall handler for thread executors
+        let null_syscall = Arc::new(NullSyscall {});
+
         // Main execution loop - process until termination
-        while !terminate_detected && (max_cycles.is_none() || self.cycles.user < max_cycles.unwrap()) {
+        while !terminate_detected
+            && (max_cycles.is_none() || self.cycles.user < max_cycles.unwrap())
+        {
             // Capture initial state for this round of parallelism
             let initial_state = self.capture_state()?;
-            
+
             // Create multiple execution chunks to be processed in parallel
             let mut chunks = Vec::new();
-            
+
             // Phase 1: Identify independent chunks by static analysis
-            let _current_pc = self.pc;
             let mut reached_segment_boundary = false;
-            
+
             // Initial exploration phase - identify chunks that can be executed in parallel
-            for _chunk_idx in 0..config.max_threads * 2 {  // Create 2x as many chunks as threads for better balancing
+            for _chunk_idx in 0..config.max_threads * 2 {
+                // Create 2x as many chunks as threads for better balancing
                 // Stop creating chunks if we hit termination or segment boundary
                 if reached_segment_boundary {
                     break;
                 }
-                
+
                 // Execute a chunk to identify PC locations for future parallel execution
                 let mut emu = Emulator::new();
                 let mut chunk = Vec::with_capacity(chunk_size);
                 let mut instruction_count = 0;
-                
+
                 // Analyze ahead to find chunk boundaries
                 while instruction_count < chunk_size {
                     // Check if we need to split on segment boundary
@@ -505,32 +514,32 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                         reached_segment_boundary = true;
                         break;
                     }
-                    
+
                     // Record this PC in the chunk
                     chunk.push(self.pc);
-                    
+
                     // Execute one instruction to advance state, but do not commit changes yet
                     Risc0Machine::step(&mut emu, self)?;
                     instruction_count += 1;
-                    
+
                     // Check if this instruction caused termination
                     if self.terminate_state.is_some() {
                         terminate_detected = true;
                         break;
                     }
                 }
-                
+
                 // Save this chunk if it has instructions
                 if !chunk.is_empty() {
                     chunks.push(chunk);
                 }
-                
+
                 // Stop if we've reached termination
                 if terminate_detected {
                     break;
                 }
             }
-            
+
             // If we have no chunks or hit segment boundary, handle the boundary
             if chunks.is_empty() || reached_segment_boundary {
                 if reached_segment_boundary {
@@ -548,7 +557,8 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                     );
 
                     // Create and process segment
-                    let segment = self.create_segment(segment_po2, segment_threshold, segment_counter)?;
+                    let segment =
+                        self.create_segment(segment_po2, segment_threshold, segment_counter)?;
                     callback(segment)?;
 
                     segment_counter += 1;
@@ -558,14 +568,14 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                     self.cycles.total += total_cycles;
                     self.cycles.paging += pager_cycles;
                     self.cycles.reserved += total_cycles - pager_cycles - user_cycles;
-                    
+
                     self.reset_segment_state()?;
                 }
-                
+
                 // Continue to next iteration
                 continue;
             }
-            
+
             // Skip parallelism for tiny chunks, just use sequential execution
             if chunks.len() == 1 && chunks[0].len() < chunk_size / 4 {
                 // The state has already been advanced during chunk creation,
@@ -574,44 +584,41 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                 total_chunks_executed += 1;
                 continue;
             }
-            
+
             // Phase 2: True parallel execution of chunks
             if chunks.len() > 1 {
                 tracing::debug!("Executing {} chunks in parallel", chunks.len());
-                
+
                 // Restore initial state before parallel execution
                 self.apply_state(&initial_state)?;
-                
-                // Clone the current state for parallel execution - already done above
-                
+
                 // Execute chunks in parallel using Rayon
                 let results = Arc::new(Mutex::new(Vec::with_capacity(chunks.len())));
-                
+
                 rayon::scope(|s| {
                     for (chunk_idx, chunk) in chunks.iter().enumerate() {
                         let results_clone = Arc::clone(&results);
                         let chunk_clone = chunk.clone();
-                        // Clone the state for this specific task
-                        let initial_state_for_thread = initial_state.clone();
-                        
+                        let null_syscall_clone = Arc::clone(&null_syscall);
+                        let initial_state = initial_state.clone(); // Clone for each thread
+
                         // Spawn a task for each chunk
                         s.spawn(move |_| {
-                            // Create a new executor for this thread
+                            // Create a new executor for this thread - use the persistent reference
                             let mut thread_executor = Executor::new(
-                                MemoryImage2::default(), // Placeholder, will be overwritten
-                                &NullSyscall {}, // No syscalls in parallel execution
-                                None,            // No input in parallel execution
-                                Vec::new(),      // No tracing in parallel execution
+                                MemoryImage2::default(), // Placeholder, will be populated by apply_state
+                                &*null_syscall_clone,    // Dereference the Arc
+                                None,
+                                Vec::new(),
                             );
-                            
+
                             // Restore the initial state
-                            let state_result = thread_executor.apply_state(&initial_state_for_thread);
+                            let state_result = thread_executor.apply_state(&initial_state);
                             if let Ok(()) = state_result {
                                 // Execute the chunk
-                                if let Ok((chunk_result, status)) = thread_executor.execute_chunk(
-                                    &chunk_clone, 
-                                    segment_threshold
-                                ) {
+                                if let Ok((chunk_result, status)) =
+                                    thread_executor.execute_chunk(&chunk_clone, segment_threshold)
+                                {
                                     // Lock and store the result
                                     let mut results = results_clone.lock().unwrap();
                                     results.push((chunk_idx, chunk_result, status));
@@ -620,76 +627,78 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                         });
                     }
                 });
-                
+
                 // Get results from the mutex
                 let results = {
                     let guard = results.lock().unwrap();
-                    // Copy out of the mutex guard, since it doesn't implement Clone
-                    guard.iter().map(|&(idx, ref res, status)| {
-                        (idx, res.clone(), status)
-                    }).collect::<Vec<_>>()
+                    // Copy out of the mutex guard
+                    guard
+                        .iter()
+                        .map(|&(idx, ref res, status)| (idx, res.clone(), status))
+                        .collect::<Vec<_>>()
                 };
-                
+
                 // Sort results by chunk index to ensure deterministic order
                 let mut sorted_results = results;
                 sorted_results.sort_by_key(|(idx, _, _)| *idx);
-                
+
                 // Check for conflicts and apply results
                 let mut apply_next_chunk = true;
                 let mut reached_segment_boundary = false;
-                
+
                 // Process the results in order
                 for (_chunk_idx, result, status) in sorted_results {
                     if !apply_next_chunk {
                         // Skip this chunk since we had a dependency conflict
                         continue;
                     }
-                    
+
                     // Check if we hit a special condition
                     match status {
                         ChunkStatus::SegmentBoundary => {
                             reached_segment_boundary = true;
                             apply_next_chunk = false;
-                        },
+                        }
                         ChunkStatus::Termination => {
                             terminate_detected = true;
                             apply_next_chunk = false;
-                        },
+                        }
                         ChunkStatus::Conflict => {
                             // Dependency conflict, stop applying chunks
                             apply_next_chunk = false;
-                        },
+                        }
                         ChunkStatus::Success => {
                             // Keep applying chunks
                         }
                     }
-                    
+
                     // Apply the result if allowed
                     if apply_next_chunk {
                         // Apply the final state from this chunk
                         self.apply_state(&result.state)?;
-                        
+
                         // Apply any memory writes
                         for (addr, value) in result.memory_writes {
                             self.store_u32(addr, value)?;
                         }
-                        
+
                         // Append read and write records
                         self.read_record.extend(result.read_record);
                         self.write_record.extend(result.write_record);
-                        
+
                         total_chunks_executed += 1;
                     }
                 }
-                
+
                 // Handle segment boundary if reached
                 if reached_segment_boundary {
                     tracing::debug!("Segment boundary reached during parallel execution");
-                    
+
                     // Create and process segment
-                    let segment = self.create_segment(segment_po2, segment_threshold, segment_counter)?;
+                    let segment =
+                        self.create_segment(segment_po2, segment_threshold, segment_counter)?;
                     callback(segment)?;
-                    
+
                     segment_counter += 1;
                     let total_cycles = 1 << segment_po2;
                     let pager_cycles = self.pager.cycles as u64;
@@ -697,7 +706,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                     self.cycles.total += total_cycles;
                     self.cycles.paging += pager_cycles;
                     self.cycles.reserved += total_cycles - pager_cycles - user_cycles;
-                    
+
                     self.reset_segment_state()?;
                 }
             } else {
@@ -705,7 +714,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                 total_chunks_executed += 1;
             }
         }
-        
+
         // Final segment creation for termination
         if terminate_detected {
             Risc0Machine::suspend(self)?;
@@ -720,9 +729,9 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
                 claim: Rv32imV2Claim {
                     pre_state: pre_digest,
                     post_state: post_digest,
-                    input: self.input_digest.clone(),
-                    output: self.output_digest.clone(),
-                    terminate_state: self.terminate_state.clone(),
+                    input: self.input_digest,
+                    output: self.output_digest,
+                    terminate_state: self.terminate_state,
                     shutdown_cycle: None,
                 },
                 read_record: std::mem::take(&mut self.read_record),
@@ -742,19 +751,22 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             self.cycles.paging += pager_cycles;
             self.cycles.reserved += final_cycles - pager_cycles - user_cycles;
         }
-        
+
         // Create final result
         let post_digest = self.pager.image.image_id();
         let session_claim = Rv32imV2Claim {
             pre_state: initial_digest,
             post_state: post_digest,
-            input: self.input_digest.clone(),
-            output: self.output_digest.clone(),
-            terminate_state: self.terminate_state.clone(),
+            input: self.input_digest,
+            output: self.output_digest,
+            terminate_state: self.terminate_state,
             shutdown_cycle: None,
         };
 
-        tracing::info!("Executed {} chunks in parallel execution", total_chunks_executed);
+        tracing::info!(
+            "Executed {} chunks in parallel execution",
+            total_chunks_executed
+        );
 
         Ok(ExecutorResult {
             segments: segment_counter + 1,
@@ -766,7 +778,6 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
             claim: session_claim,
         })
     }
-    
 }
 
 /// A null syscall implementation for speculative execution
@@ -776,12 +787,13 @@ impl Syscall for NullSyscall {
     fn host_read(&self, _ctx: &mut dyn SyscallContext, _fd: u32, _buf: &mut [u8]) -> Result<u32> {
         Ok(0) // No reads in speculative execution
     }
-    
+
     fn host_write(&self, _ctx: &mut dyn SyscallContext, _fd: u32, _buf: &[u8]) -> Result<u32> {
         Ok(0) // No writes in speculative execution
     }
 }
 
+#[allow(clippy::needless_lifetimes)]
 impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
     #[inline]
     fn reset(&mut self) {
@@ -819,7 +831,7 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
         if self.trace.is_empty() {
             return Ok(());
         }
-        
+
         // Get all pager trace events and process them
         let events = self.pager.trace_events();
         if !events.is_empty() {
@@ -835,7 +847,8 @@ impl<'a, 'b, S: Syscall> Executor<'a, 'b, S> {
     }
 }
 
-impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
+#[allow(clippy::needless_lifetimes)]
+impl<'a, 'b, S: Syscall> Risc0Context for Executor<'a, 'b, S> {
     #[inline(always)]
     fn get_pc(&self) -> ByteAddr {
         self.pc
@@ -871,10 +884,10 @@ impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
 
     #[inline]
     fn on_insn_start(&mut self, insn: &Instruction, decoded: &DecodedInstruction) -> Result<()> {
-        // Track execution cycle 
+        // Track execution cycle
         let cycle = self.cycles.user;
         self.cycles.user += 1;
-        
+
         // Debug trace logging - only executed when tracing is enabled
         if tracing::enabled!(tracing::Level::TRACE) {
             tracing::trace!(
@@ -886,7 +899,7 @@ impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
                 disasm(insn, decoded)
             );
         }
-        
+
         // Handle instruction tracing if enabled
         if !self.trace.is_empty() {
             self.trace(TraceEvent::InstructionStart {
@@ -904,7 +917,7 @@ impl<S: Syscall> Risc0Context for Executor<'_, '_, S> {
         // Update cycle counters
         self.user_cycles += 1;
         self.phys_cycles += 1;
-        
+
         // Handle any pending pager trace events
         self.trace_pager()?;
         Ok(())
